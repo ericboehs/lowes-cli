@@ -15,7 +15,7 @@ module Lowes
         when "set"
           set_store(argv)
         else
-          # Allow `lowes store 73703` shorthand for `lowes store set 73703`
+          # Allow `lowes store 28105` shorthand for `lowes store set 28105`
           if action.match?(/\A\d{5}\z/)
             set_store([action, *argv])
           else
@@ -56,7 +56,7 @@ module Lowes
         zip ||= config.store_zip
         unless zip&.match?(/\A\d{5}\z/)
           warn "store set: 5-digit ZIP required (got #{zip.inspect})"
-          warn "  pass as `lowes store 73703` or set `store_zip` in config"
+          warn "  pass as `lowes store 28105` or set `store_zip` in config"
           return 2
         end
 
@@ -90,8 +90,8 @@ module Lowes
             lowes store           # print current Lowe's store cookies (sn, region, etc.)
 
           set:
-            lowes store 73703     # change My Store to first Lowe's near ZIP 73703
-            lowes store set 73703 # explicit form
+            lowes store 28105     # change My Store to first Lowe's near ZIP 28105
+            lowes store set 28105 # explicit form
             lowes store set       # use config.store_zip
 
           The `set` form drives Lowe's store-finder UI in your CDP-attached

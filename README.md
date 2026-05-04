@@ -41,6 +41,11 @@ fetched_at           model     title                              price    statu
 - **Materials list** — keep a watchlist of products; `lowes prices`
   refreshes every entry in one run.
 - **JSON-first storage** under XDG paths — easy to grep, jq, or back up.
+- **Local web UI** (`lowes web`) — Sinatra app at `localhost:4567` with
+  search across order IDs, item titles, and model numbers; year filter
+  pills; compact / comfortable / gallery density modes; per-year stats
+  with totals; and item-level pages with line totals, per-unit pricing,
+  and price history sparklines for tracked materials.
 
 ## Architecture
 
@@ -103,7 +108,7 @@ lowes config edit
   "email":           "you@example.com",
   "password_op_ref": "op://Personal/Lowes/password",
   "otp_op_ref":       null,
-  "default_year_window": 2,
+  "default_year_window": 5,
   "store_zip":        null,
   "output": { "color": true }
 }
@@ -163,7 +168,44 @@ lowes price 1001234 --history  # show local history without hitting network
 
 lowes prices                   # refresh every tracked material
 lowes prices --only "2x4 stud" # just one
+
+# Web UI
+lowes web                      # http://127.0.0.1:4567
 ```
+
+## Web UI
+
+`lowes web` boots a local Sinatra app for browsing the synced data:
+
+- `/`                — order list with search, year filter, density toggle, pagination
+- `/?q=<query>`      — substring search over titles, models, item IDs; results
+                       surface the matched item per order (not just `items[0]`)
+- `/orders/:id`      — order detail with hero image, line totals, per-unit
+                       breakdown for by-the-foot/roll items, ship-to, payment
+- `/stats`           — yearly orders/totals/avg/largest with bar viz
+- `/quotes`          — saved Lowe's quotes
+- `/materials`       — tracked materials with sparklines
+- `/prices/:key`     — full price history for one tracked item
+
+Images route through a same-origin proxy (`/img?u=...`) that falls back to a
+generic SVG placeholder when Lowe's returns 404 or its `no_image_available`
+GIF for delisted products.
+
+## Pricing schema
+
+Items in saved order JSON normalize Lowe's quirky display:
+
+| field         | meaning                                       |
+|---------------|-----------------------------------------------|
+| `price`       | per-unit, post-discount (e.g. `$0.92/ft`)     |
+| `was_price`   | per-unit, pre-discount (null when not on sale)|
+| `line_total`  | line total post-discount (`price × qty`, or DOM-extracted) |
+| `line_was`    | line total pre-discount (DOM-extracted, else `was_price × qty`) |
+| `quantity`    | qty as shown in `QTY N`                       |
+
+Lowe's by-the-foot / by-the-roll products mix per-unit and line-total
+strikethroughs; the worker picks both apart and stores them in canonical
+fields, so the web UI doesn't need a heuristic.
 
 ## Tuning rate limits
 
@@ -183,11 +225,15 @@ Defaults are conservative; tune via `config.json`:
 ## Selectors and site drift
 
 Lowe's HTML structure changes regularly. The extractors live near the top
-of `pyworker/fetch.py` (`ORDERS_EXTRACT_JS`, `QUOTES_EXTRACT_JS`,
+of `pyworker/fetch.py` (`ORDERS_EXTRACT_JS`, `ORDER_DETAIL_EXTRACT_JS`,
 `PRICE_EXTRACT_JS`) as JS strings that run in the page. Each extractor is
 defensive — missing fields return `null` rather than crashing the run, so a
 single broken selector won't kill a whole year of orders. When something
 stops parsing, that's where to look first.
+
+`sync` iterates years in quarterly date-range chunks
+(`?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD`), because the `?show=YYYY` view
+silently caps at 50 orders per year — quarters dodge the cap.
 
 ## License
 

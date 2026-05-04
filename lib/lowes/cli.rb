@@ -75,7 +75,7 @@ module Lowes
           prices     Sync current prices for all tracked materials
           materials  Manage tracked materials list (add/list/remove)
           quotes     List or show saved quotes
-          store      Show current Lowe's store, or set it (`lowes store 73703`)
+          store      Show current Lowe's store, or set it (`lowes store 28105`)
           config     Show or edit config
           help       Show this help
 
