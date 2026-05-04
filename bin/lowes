@@ -1,0 +1,29 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "pathname"
+
+ROOT = Pathname(__dir__).join("..").realpath
+$LOAD_PATH.unshift(ROOT.join("lib").to_s)
+
+require "lowes/config"
+require "lowes/store"
+require "lowes/worker"
+require "lowes/formatter"
+require "lowes/cli"
+require "lowes/commands/login"
+require "lowes/commands/sync"
+require "lowes/commands/list"
+require "lowes/commands/show"
+require "lowes/commands/search"
+require "lowes/commands/config"
+require "lowes/commands/price"
+require "lowes/commands/prices"
+require "lowes/commands/materials"
+require "lowes/commands/quotes"
+require "lowes/commands/chrome_start"
+require "lowes/commands/web"
+require "lowes/commands/store"
+require "lowes/chrome"
+
+exit(Lowes::CLI.run(ARGV))
