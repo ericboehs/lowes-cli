@@ -19,6 +19,8 @@ jobs:
           for f in $(find bin lib web.rb -type f \( -name "*.rb" -o -name lowes \)); do
             ruby -c "$f"
           done
+      - name: Run Minitest
+        run: rake test
 
   python:
     runs-on: ubuntu-latest

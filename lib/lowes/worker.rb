@@ -66,16 +66,6 @@ module Lowes
       _run_action(request)[:orders]
     end
 
-    def sync_quotes(email:, password:, otp_secret: nil)
-      request = {
-        action: "sync_quotes",
-        email: email,
-        password: password,
-        otp_secret: otp_secret
-      }.compact
-      _run_action(request)[:quotes]
-    end
-
     def fetch_prices(items:, store_zip: nil)
       request = {
         action: "fetch_prices",

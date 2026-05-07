@@ -7,7 +7,6 @@ module Lowes
   class Store
     def initialize
       @orders_dir = Config.orders_dir
-      @quotes_dir = Config.quotes_dir
       @prices_dir = Config.prices_dir
       @index_path = Config.index_path
       @materials_path = Config.materials_path
@@ -17,7 +16,7 @@ module Lowes
       @index ||= if @index_path.exist?
         JSON.parse(File.read(@index_path))
       else
-        { "last_sync" => nil, "orders" => {}, "quotes" => {} }
+        { "last_sync" => nil, "orders" => {} }
       end
     end
 
@@ -81,44 +80,6 @@ module Lowes
         hits << order if match
       end
       hits.sort_by { |o| o["order_placed"].to_s }.reverse
-    end
-
-    # ----- Quotes -----
-
-    def write_quote(quote)
-      id = quote["quote_id"]
-      raise "quote missing quote_id" unless id
-
-      year = year_for(quote, "created")
-      year_dir = @quotes_dir.join(year.to_s)
-      FileUtils.mkdir_p(year_dir)
-      file = year_dir.join("#{id}.json")
-      File.write(file, JSON.pretty_generate(quote) + "\n")
-
-      relative = file.relative_path_from(Config.data_dir).to_s
-      index["quotes"] ||= {}
-      index["quotes"][id] = {
-        "year" => year,
-        "date" => quote["created"],
-        "total" => quote["total"],
-        "status" => quote["status"],
-        "name" => quote["name"],
-        "file" => relative
-      }
-      file
-    end
-
-    def read_quote(quote_id)
-      meta = (index["quotes"] || {})[quote_id]
-      return nil unless meta
-      JSON.parse(File.read(Config.data_dir.join(meta["file"])))
-    end
-
-    def list_quotes(limit: nil)
-      rows = (index["quotes"] || {}).map { |id, meta| meta.merge("quote_id" => id) }
-      rows.sort_by! { |r| r["date"].to_s }.reverse!
-      rows = rows.first(limit) if limit
-      rows
     end
 
     # ----- Materials & price history -----

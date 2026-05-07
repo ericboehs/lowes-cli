@@ -39,6 +39,7 @@ module Lowes
         cmd = [
           CHROME_APP,
           "--remote-debugging-port=#{port}",
+          "--remote-allow-origins=*",
           "--user-data-dir=#{profile}",
           "--no-default-browser-check",
           "--no-first-run",

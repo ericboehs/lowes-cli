@@ -26,6 +26,7 @@ module Lowes
     def store_zip = data["store_zip"]
     def color? = data.dig("output", "color") != false
     def rate_limit = data["rate_limit"] || {}
+    def default_tax_rate = data["default_tax_rate"]
 
     class << self
       def xdg_config_home
@@ -44,7 +45,6 @@ module Lowes
       def config_path = config_dir.join("config.json")
       def data_dir = xdg_data_home.join("lowes")
       def orders_dir = data_dir.join("orders")
-      def quotes_dir = data_dir.join("quotes")
       def prices_dir = data_dir.join("prices")
       def cache_dir = data_dir.join("cache")
       def index_path = data_dir.join("index.json")
@@ -53,7 +53,7 @@ module Lowes
       def sync_log_path = state_dir.join("sync.log")
 
       def ensure_dirs!
-        [config_dir, data_dir, orders_dir, quotes_dir, prices_dir, cache_dir, state_dir].each do |d|
+        [config_dir, data_dir, orders_dir, prices_dir, cache_dir, state_dir].each do |d|
           FileUtils.mkdir_p(d)
         end
         File.chmod(0o700, cache_dir) if File.directory?(cache_dir)

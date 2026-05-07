@@ -64,8 +64,8 @@ module Lowes
       return puts(JSON.pretty_generate(rows)) if @json
       return puts("(no quotes — run `lowes quotes sync`)") if rows.empty?
 
-      headers = %w[date quote_id name total status]
-      data = rows.map { |r| [r["date"], r["quote_id"], r["name"].to_s[0, 40], format_money(r["total"]), r["status"] || ""] }
+      headers = %w[date type quote_id name total status]
+      data = rows.map { |r| [r["date"], r["type"] || "online", r["quote_id"], r["name"].to_s[0, 40], format_money(r["total"]), r["status"] || ""] }
       print_table(headers, data)
     end
 
@@ -73,11 +73,23 @@ module Lowes
       return puts(JSON.pretty_generate(q)) if @json
       return puts("(not found)") unless q
 
-      puts "#{bold("Quote")} #{q["quote_id"]}"
-      puts "  Name:   #{q["name"]}"          if q["name"]
+      puts "#{bold("Quote")} #{q["quote_id"]} #{dim("[#{q["type"] || "online"}]")}"
+      puts "  Name:    #{q["name"]}"          if q["name"]
       puts "  Created: #{q["created"]}"
       puts "  Status:  #{q["status"]}"        if q["status"]
+      if q["subtotal_list"] && q["subtotal"] && q["subtotal_list"] != q["subtotal"]
+        savings_pct = q["savings_pct"] || ((q["total_savings"].to_f / q["subtotal_list"].to_f) * 100).round(1)
+        puts "  List:    #{format_money(q["subtotal_list"])}"
+        puts "  Savings: #{format_money(q["total_savings"])} (#{savings_pct}%)"
+      end
       puts "  Total:   #{format_money(q["total"])}"
+      if (sources = q["savings_summary"]) && !sources.empty?
+        puts "  via:     #{sources.join(", ")}"
+      end
+      if (gap = q["vsp_to_qualify"]) && gap > 0
+        threshold = q["vsp_threshold"] ? " (threshold #{format_money(q["vsp_threshold"])})" : ""
+        puts "  #{bold("↑ Add #{format_money(gap)} for a Member Volume Discount")}#{dim(threshold)}"
+      end
       puts "  Store:   #{q["store"]}"         if q["store"]
       puts "  Link:    #{q["link"]}"          if q["link"]
 
@@ -87,9 +99,22 @@ module Lowes
       items.each do |it|
         title = it["title"].to_s
         qty   = it["quantity"] ? "x#{it["quantity"]} " : ""
-        price = it["price"] ? " — #{format_money(it["price"])}" : ""
         model = it["model"] ? " [#{it["model"]}]" : ""
-        puts "  • #{qty}#{title}#{model}#{price}"
+        puts "  • #{qty}#{title}#{model}"
+
+        unit_paid = it["unit_price"]
+        unit_list = it["unit_price_list"]
+        if unit_paid && unit_list && unit_list != unit_paid
+          pct = it["discount_pct"] || ((unit_list - unit_paid) / unit_list.to_f * 100).round(1)
+          line = "    #{format_money(unit_paid)}/ea " \
+                 "#{dim("(was #{format_money(unit_list)}, −#{pct}%)")}"
+          line += " — line #{format_money(it["line_total"])}" if it["line_total"]
+          puts line
+        elsif unit_paid
+          line = "    #{format_money(unit_paid)}/ea"
+          line += " — line #{format_money(it["line_total"])}" if it["line_total"]
+          puts line
+        end
       end
     end
 
