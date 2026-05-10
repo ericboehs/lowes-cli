@@ -161,8 +161,9 @@ module Lowes
             id ||= a
           end
         end
-        return missing("delete") unless id
         Lowes::Config.load
+        id ||= pick_quote_id_interactive
+        return missing("delete") unless id
         unless force
           $stderr.print "delete quote #{id}? [y/N] "
           return 0 unless %w[y yes].include?($stdin.gets&.strip&.downcase)
@@ -184,8 +185,9 @@ module Lowes
             src_id ||= a
           end
         end
-        return missing("clone") unless src_id
         Lowes::Config.load
+        src_id ||= pick_quote_id_interactive
+        return missing("clone") unless src_id
         resp = online_client.duplicate_quote(src_id, description: new_name.to_s)
         q = resp["onlineQuote"] || resp
         @global[:json] ? puts(JSON.pretty_generate(q)) : puts(q["quoteId"])
@@ -255,17 +257,26 @@ module Lowes
           case a
           when "-y", "--yes" then force = true
           when "-h", "--help"
-            puts "Usage: lowes quotes remove <quote-id> <line-id> [-y]"
+            puts "Usage: lowes quotes remove [<quote-id>] [<line-id>] [-y]"
             return 0
           else
             if id.nil? then id = a else line_id ||= a end
           end
         end
-        unless id && line_id
-          warn "quotes remove: <quote-id> and <line-id> are required"
+
+        Lowes::Config.load
+        id ||= pick_quote_id_interactive
+        unless id
+          warn "quotes remove: <quote-id> is required"
           return 2
         end
-        Lowes::Config.load
+
+        line_id ||= pick_line_id_interactive(id)
+        unless line_id
+          warn "quotes remove: <line-id> is required"
+          return 2
+        end
+
         unless force
           $stderr.print "remove line #{line_id} from #{id}? [y/N] "
           return 0 unless %w[y yes].include?($stdin.gets&.strip&.downcase)
@@ -273,6 +284,34 @@ module Lowes
         online_client.remove_item(id, line_id)
         warn "removed line #{line_id}" unless @global[:quiet]
         0
+      end
+
+      def pick_line_id_interactive(quote_id)
+        return nil unless $stdin.tty? && $stdout.tty? && fzf_path
+        q = fetch_online_quote(quote_id)
+        return nil unless q
+        items = q["items"] || []
+        return nil if items.empty?
+        fzf_pick_line(items)
+      end
+
+      def fzf_pick_line(items)
+        f = Lowes::Formatter.new
+        lines = items.map { |it|
+          qty   = "x#{it["quantity"]}".ljust(5)
+          unit  = f.send(:format_money, it["unit_price"]).rjust(10)
+          title = it["title"].to_s
+          [it["line"], qty, unit, title].join("\t")
+        }.join("\n")
+
+        IO.popen([fzf_path, "--delimiter=\t", "--with-nth=2..", "--ansi",
+                  "--prompt=line> ", "--header=qty    unit       item",
+                  "--height=40%", "--reverse"], "r+") do |io|
+          io.write(lines)
+          io.close_write
+          choice = io.read.to_s.strip
+          choice.empty? ? nil : choice.split("\t", 2).first
+        end
       end
 
       def set_fields(argv)
@@ -294,8 +333,9 @@ module Lowes
             id ||= a
           end
         end
-        return missing("set") unless id
         Lowes::Config.load
+        id ||= pick_quote_id_interactive
+        return missing("set") unless id
         online_client.update_quote(id, header) unless header.empty?
         qty_overrides.each { |line_id, n| online_client.update_item_quantity(id, line_id, n) }
         0
@@ -303,8 +343,9 @@ module Lowes
 
       def refresh(argv)
         id = argv.shift
-        return missing("refresh") unless id
         Lowes::Config.load
+        id ||= pick_quote_id_interactive
+        return missing("refresh") unless id
         online_client.refresh_quote(id)
         warn "refreshed #{id}" unless @global[:quiet]
         0
@@ -447,15 +488,14 @@ module Lowes
           show <id> [--refresh]             show one quote (auto-prompts on EXPIRED)
           new --name NAME [--note ...] [--po ...]
                                             create a new empty quote
-          delete <id> [-y]                  delete a quote
-          clone <id> [--name NAME]          duplicate a quote
+          delete [<id>] [-y]                delete a quote (fzf-picks if no id)
+          clone [<id>] [--name NAME]        duplicate a quote (fzf-picks if no id)
           add [<id>] <url|item-id> [--qty N]
-                                            add a line item (omit <id> + pass a URL
-                                            to fzf-pick the quote interactively)
-          remove <id> <line-id> [-y]        remove a line item
-          set <id> [--name ...] [--note ...] [--po ...] [--qty LINE_ID=N ...]
+                                            add a line item (fzf-picks if no id)
+          remove [<id>] [<line-id>] [-y]    remove a line item (fzf-picks both)
+          set [<id>] [--name ...] [--note ...] [--po ...] [--qty LINE_ID=N ...]
                                             update quote header / line quantity
-          refresh <id>                      re-price a quote on lowes.com
+          refresh [<id>]                    re-price a quote on lowes.com
           refresh-cookies                   pull fresh session cookies from Chrome
         HELP
       end
