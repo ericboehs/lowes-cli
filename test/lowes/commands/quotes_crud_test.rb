@@ -273,6 +273,13 @@ class QuotesCrudTest < Minitest::Test
     assert_equal "4747075", add[2].first["productInfo"]["omniItemId"]
   end
 
+  def test_add_with_only_url_and_no_tty_errors_clearly
+    rc = nil
+    _out, err = capture_io { rc = @cmd.run(["add", "https://www.lowes.com/pd/Foo/4747075"]) }
+    assert_equal 2, rc
+    assert_match(/<quote-id> is required/, err)
+  end
+
   def test_add_rejects_unparseable_target
     rc = nil
     _out, err = capture_io { rc = @cmd.run(["add", "240", "ABC-MODEL"]) }

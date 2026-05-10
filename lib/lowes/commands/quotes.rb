@@ -198,25 +198,55 @@ module Lowes
           case a
           when "--qty" then qty = Integer(argv.shift)
           when "-h", "--help"
-            puts "Usage: lowes quotes add <quote-id> <url|item-id> [--qty N]"
+            puts "Usage: lowes quotes add [<quote-id>] <url|item-id> [--qty N]"
             return 0
           else
             if id.nil? then id = a else target ||= a end
           end
         end
-        unless id && target
-          warn "quotes add: <quote-id> and <url|item-id> are required"
+
+        # Single positional that looks like a URL → treat as target, pick the quote.
+        if id && target.nil? && url_like?(id)
+          target = id
+          id = nil
+        end
+
+        unless target
+          warn "quotes add: <url|item-id> is required"
           return 2
         end
+
         item_id = resolve_item_id(target)
         unless item_id
           warn "quotes add: pass a numeric omniItemId or a Lowe's product URL (e.g. lowes.com/pd/<slug>/<digits>)"
           return 2
         end
+
         Lowes::Config.load
+
+        unless id
+          id = pick_quote_id_interactive
+          unless id
+            warn "quotes add: <quote-id> is required (or run interactively with fzf)"
+            return 2
+          end
+        end
+
         online_client.add_items(id, [{ "productInfo" => { "omniItemId" => item_id }, "quantity" => qty }])
         warn "added #{item_id} (qty #{qty}) to #{id}" unless @global[:quiet]
         0
+      end
+
+      def url_like?(s)
+        s.to_s.start_with?("http://", "https://") || s =~ %r{\A(?:www\.)?lowes\.com/}i
+      end
+
+      def pick_quote_id_interactive
+        return nil unless $stdin.tty? && $stdout.tty? && fzf_path
+        rows = (online_client.search["quotes"] || []).map { |q| online_quote_to_row(q) }
+                                                     .sort_by { |r| r["created"].to_s }.reverse
+        return nil if rows.empty?
+        fzf_pick_quote(rows)
       end
 
       def remove_item(argv)
@@ -419,7 +449,9 @@ module Lowes
                                             create a new empty quote
           delete <id> [-y]                  delete a quote
           clone <id> [--name NAME]          duplicate a quote
-          add <id> <url|item-id> [--qty N]  add a line item
+          add [<id>] <url|item-id> [--qty N]
+                                            add a line item (omit <id> + pass a URL
+                                            to fzf-pick the quote interactively)
           remove <id> <line-id> [-y]        remove a line item
           set <id> [--name ...] [--note ...] [--po ...] [--qty LINE_ID=N ...]
                                             update quote header / line quantity
