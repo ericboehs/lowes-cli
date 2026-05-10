@@ -169,6 +169,32 @@ class QuotesCrudTest < Minitest::Test
     assert_includes out, "threshold $2000.00"
   end
 
+  def test_show_with_refresh_flag_calls_refresh_before_fetching
+    @stub.add_detail("777", {
+      "quoteId" => "777", "quoteDescription" => "Old",
+      "displayQuoteStatus" => "READY TO BUY", "createdTs" => "2026-01-01",
+      "cartItems" => {}, "cartSummary" => {}
+    })
+    capture_io { @cmd.run(["show", "777", "--refresh"]) }
+    refresh = @stub.calls.find { |c| c.first == :refresh }
+    get = @stub.calls.find { |c| c.first == :get }
+    assert_equal [:refresh, "777"], refresh
+    refute_nil get
+    assert @stub.calls.index(refresh) < @stub.calls.index(get),
+      "refresh must run before get_quote"
+  end
+
+  def test_show_does_not_prompt_for_refresh_when_not_a_tty
+    @stub.add_detail("666", {
+      "quoteId" => "666", "quoteDescription" => "Old",
+      "displayQuoteStatus" => "EXPIRED", "createdTs" => "2026-01-01",
+      "cartItems" => {}, "cartSummary" => {}
+    })
+    capture_io { @cmd.run(["show", "666"]) }
+    refute @stub.calls.any? { |c| c.first == :refresh },
+      "should not auto-refresh when stdin is not a tty"
+  end
+
   def test_show_returns_1_when_api_404s
     rc = nil
     capture_io { rc = @cmd.run(["show", "missing"]) }

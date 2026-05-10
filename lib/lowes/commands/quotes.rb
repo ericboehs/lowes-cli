@@ -9,9 +9,10 @@ module Lowes
       end
 
       def run(argv)
-        action = argv.shift || "list"
+        action = argv.shift || default_action
         case action
         when "list"            then list(argv)
+        when "pick"            then pick(argv)
         when "show"            then show(argv)
         when "new"             then create(argv)
         when "delete"          then delete(argv)
@@ -30,6 +31,50 @@ module Lowes
       end
 
       private
+
+      # Bare `lowes quotes` is a picker when interactive + fzf is around.
+      # Otherwise (pipes, scripts, --json, no fzf) fall through to plain list.
+      def default_action
+        return "list" if @global[:json]
+        return "list" unless $stdin.tty? && $stdout.tty?
+        return "list" unless fzf_path
+        "pick"
+      end
+
+      def fzf_path
+        @fzf_path ||= ENV["PATH"].to_s.split(File::PATH_SEPARATOR)
+                                 .map { |d| File.join(d, "fzf") }
+                                 .find { |p| File.executable?(p) }
+      end
+
+      def pick(_argv)
+        Lowes::Config.load
+        rows = (online_client.search["quotes"] || []).map { |q| online_quote_to_row(q) }
+                                                     .sort_by { |r| r["created"].to_s }.reverse
+        return puts("(no quotes)") if rows.empty?
+
+        chosen_id = fzf_pick_quote(rows)
+        return 0 unless chosen_id
+        show([chosen_id])
+      end
+
+      def fzf_pick_quote(rows)
+        # Tab-separated lines: id is hidden in column 1, display columns follow.
+        # fzf's --with-nth/--delimiter shows columns 2.. while preserving column 1
+        # for selection; --print-query keeps it scriptable later.
+        lines = rows.map { |r|
+          [r["quote_id"], r["date"], r["status"].to_s.ljust(14), Lowes::Formatter.new.send(:format_money, r["total"]).rjust(10), r["name"].to_s].join("\t")
+        }.join("\n")
+
+        IO.popen([fzf_path, "--delimiter=\t", "--with-nth=2..", "--ansi",
+                  "--prompt=quote> ", "--header=date        status         total       name",
+                  "--height=40%", "--reverse"], "r+") do |io|
+          io.write(lines)
+          io.close_write
+          choice = io.read.to_s.strip
+          choice.empty? ? nil : choice.split("\t", 2).first
+        end
+      end
 
       def list(argv)
         limit = nil
@@ -53,10 +98,31 @@ module Lowes
       end
 
       def show(argv)
-        id = argv.shift
+        id = nil
+        do_refresh = false
+        while (a = argv.shift)
+          case a
+          when "--refresh" then do_refresh = true
+          when "-h", "--help"
+            puts "Usage: lowes quotes show <id> [--refresh]"
+            return 0
+          else
+            id ||= a
+          end
+        end
         return missing("show") unless id
         Lowes::Config.load
+        try_refresh(id) if do_refresh
         q = fetch_online_quote(id)
+
+        if q && !do_refresh && q["status"].to_s.upcase == "EXPIRED" && $stdin.tty? && !@global[:json]
+          $stderr.print "quote is expired — refresh? [Y/n] "
+          ans = $stdin.gets&.strip&.downcase
+          if ans.nil? || ans.empty? || %w[y yes].include?(ans)
+            try_refresh(id) and q = fetch_online_quote(id)
+          end
+        end
+
         Lowes::Formatter.new(json: @global[:json]).quote(q)
         q ? 0 : 1
       end
@@ -221,6 +287,14 @@ module Lowes
         0
       end
 
+      def try_refresh(id)
+        online_client.refresh_quote(id)
+        true
+      rescue Lowes::Client::Error => e
+        warn "quotes refresh: #{e.status || "?"} #{e.message[0, 200]}"
+        false
+      end
+
       def fetch_online_quote(id)
         detail = online_client.get_quote(id)["quoteDetail"] || {}
         online_quote_detail_to_quote(detail)
@@ -337,8 +411,10 @@ module Lowes
         <<~HELP
           Usage: lowes quotes <subcommand> [options]
 
-          list                              list quotes from lowes.com
-          show <id>                         show one quote
+          (no args)                         fzf picker if interactive, else list
+          list                              list quotes from lowes.com (always)
+          pick                              fzf picker (errors if fzf missing)
+          show <id> [--refresh]             show one quote (auto-prompts on EXPIRED)
           new --name NAME [--note ...] [--po ...]
                                             create a new empty quote
           delete <id> [-y]                  delete a quote
