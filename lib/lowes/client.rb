@@ -15,6 +15,9 @@ module Lowes
 
     BASE = "https://www.lowes.com/digitalpro/api/quote".freeze
     DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".freeze
+    CDP_URL = "http://127.0.0.1:9222".freeze
+    CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".freeze
+    CHROME_PROFILE = "#{Dir.home}/.local/share/lowes/cache/chrome-profile".freeze
 
     def self.from_storage_state(path = Lowes::Config.cache_dir.join("storage_state.json"), auto_refresh: true)
       raise Error, "no cookies at #{path} — run `lowes login` first" unless File.exist?(path)
@@ -24,24 +27,75 @@ module Lowes
 
     # Pulls fresh cookies from the live Chrome session via CDP and rewrites
     # storage_state.json. Akamai bot cookies (_abck, bm_*) rotate frequently,
-    # so the on-disk cookies often go stale within minutes. Run this before
-    # each request burst to avoid 403s.
-    def self.refresh_cookies!(cdp_url: "http://127.0.0.1:9222", path: Lowes::Config.cache_dir.join("storage_state.json"))
-      version = JSON.parse(Net::HTTP.get(URI("#{cdp_url}/json/version")))
-      ws_url = version["webSocketDebuggerUrl"]
-      cookies = fetch_cookies_via_cdp(ws_url)
+    # so the on-disk cookies often go stale within minutes.
+    #
+    # Auto-recovers when possible: if Chrome isn't running, starts it; if it
+    # has no lowes tab, opens one. If the user is signed out, returns 0 and
+    # prints a one-time hint — the caller's retry will then 401 with a clear
+    # message rather than a cryptic loop.
+    def self.refresh_cookies!(cdp_url: CDP_URL, path: Lowes::Config.cache_dir.join("storage_state.json"))
+      ensure_chrome_alive!(cdp_url: cdp_url)
+      cookies = cdp_get_cookies(cdp_url: cdp_url)
+      if lowes_cookies(cookies).empty?
+        ensure_lowes_tab!(cdp_url: cdp_url)
+        cookies = cdp_get_cookies(cdp_url: cdp_url)
+      end
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, JSON.pretty_generate({ "cookies" => cookies, "origins" => [] }))
-      cookies.size
+      lowes_cookies(cookies).size
     end
 
-    # Minimal CDP JSON-over-WebSocket client to call Storage.getCookies.
-    def self.fetch_cookies_via_cdp(ws_url)
-      require "socket"
-      require "openssl"
-      require "securerandom"
-      require "digest"
-      require "base64"
+    def self.lowes_cookies(cookies)
+      cookies.select { |c| c["domain"].to_s.include?("lowes.com") }
+    end
+
+    def self.ensure_chrome_alive!(cdp_url: CDP_URL, timeout: 15)
+      return if cdp_alive?(cdp_url: cdp_url)
+      warn "lowes: Chrome not reachable on #{cdp_url} — starting it"
+      start_chrome!
+      deadline = Time.now + timeout
+      sleep 0.3 until cdp_alive?(cdp_url: cdp_url) || Time.now > deadline
+      raise Error.new("Chrome did not come up within #{timeout}s on #{cdp_url}") unless cdp_alive?(cdp_url: cdp_url)
+    end
+
+    def self.cdp_alive?(cdp_url: CDP_URL)
+      Net::HTTP.get_response(URI("#{cdp_url}/json/version")).is_a?(Net::HTTPSuccess)
+    rescue StandardError
+      false
+    end
+
+    def self.start_chrome!
+      return unless File.exist?(CHROME_APP)
+      FileUtils.mkdir_p(CHROME_PROFILE)
+      cmd = [
+        CHROME_APP,
+        "--remote-debugging-port=9222",
+        "--remote-allow-origins=*",
+        "--user-data-dir=#{CHROME_PROFILE}",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "https://www.lowes.com/quotes"
+      ]
+      pid = Process.spawn(*cmd, [:out, :err] => "/dev/null")
+      Process.detach(pid)
+    end
+
+    def self.ensure_lowes_tab!(cdp_url: CDP_URL)
+      targets = JSON.parse(Net::HTTP.get(URI("#{cdp_url}/json/list"))) rescue []
+      return if targets.any? { |t| t["url"].to_s.include?("lowes.com") }
+      warn "lowes: opening lowes.com tab in Chrome"
+      cdp_browser_call("Target.createTarget", { "url" => "https://www.lowes.com/quotes" }, cdp_url: cdp_url)
+      sleep 1.5 # let cookies settle
+    end
+
+    def self.cdp_get_cookies(cdp_url: CDP_URL)
+      cdp_browser_call("Storage.getCookies", {}, cdp_url: cdp_url).dig("cookies") || []
+    end
+
+    # Minimal CDP JSON-over-WebSocket client at the browser level.
+    def self.cdp_browser_call(method, params = {}, cdp_url: CDP_URL)
+      require "socket"; require "securerandom"; require "base64"
+      ws_url = JSON.parse(Net::HTTP.get(URI("#{cdp_url}/json/version")))["webSocketDebuggerUrl"]
       uri = URI(ws_url)
       tcp = TCPSocket.new(uri.host, uri.port)
       key = Base64.strict_encode64(SecureRandom.bytes(16))
@@ -54,12 +108,11 @@ module Lowes
         "Sec-WebSocket-Version: 13",
         "", ""
       ].join("\r\n"))
-      # Drain handshake
       while (line = tcp.gets) && line.strip != ""; end
-      send_ws_text(tcp, JSON.generate({ "id" => 1, "method" => "Storage.getCookies", "params" => {} }))
+      send_ws_text(tcp, JSON.generate({ "id" => 1, "method" => method, "params" => params }))
       msg = recv_ws_text(tcp)
       tcp.close
-      JSON.parse(msg).dig("result", "cookies") || []
+      JSON.parse(msg)["result"] || {}
     end
 
     def self.send_ws_text(sock, payload)
@@ -207,10 +260,17 @@ module Lowes
       body = resp.body.to_s
       parsed = body.empty? ? nil : (try_json(body) || body)
       unless resp.is_a?(Net::HTTPSuccess)
-        if resp.code.to_i == 403 && @auto_refresh && !@refreshed_once
+        if [401, 403].include?(resp.code.to_i) && @auto_refresh && !@refreshed_once
           @refreshed_once = true
           reload_cookies!
           return request(rebuild_request(req), headers: headers)
+        end
+        if resp.code.to_i == 401
+          raise Error.new(
+            "HTTP 401 #{req.method} #{uri.path} — Chrome session is signed out. " \
+            "Open the Chrome window on port 9222 and sign in to lowes.com, then retry.",
+            status: 401, body: parsed
+          )
         end
         raise Error.new("HTTP #{resp.code} #{req.method} #{uri.path}", status: resp.code.to_i, body: parsed)
       end

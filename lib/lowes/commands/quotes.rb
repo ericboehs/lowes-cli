@@ -144,7 +144,7 @@ module Lowes
         end
         item_id = resolve_item_id(target)
         unless item_id
-          warn "quotes add: pass a numeric item-id or a Lowe's product URL ending in /<digits>"
+          warn "quotes add: pass a numeric omniItemId or a Lowe's product URL (e.g. lowes.com/pd/<slug>/<digits>)"
           return 2
         end
         Lowes::Config.load
@@ -303,14 +303,28 @@ module Lowes
         @online_client ||= Lowes::Client.from_storage_state(auto_refresh: true)
       end
 
-      # Accept a numeric item-id OR a Lowe's product URL whose path ends in /<digits>.
+      # Accept a numeric omniItemId OR a Lowe's product URL whose path ends in /<digits>.
+      # Handles bare hosts ("lowes.com/pd/...") by assuming https, strips query/fragment,
+      # and unwraps `lowes.com/redir?u=<encoded-url>` share links.
       def resolve_item_id(target)
+        target = target.to_s.strip
+        return nil if target.empty?
         return target if target.match?(/\A\d{4,}\z/)
-        if target.start_with?("http://", "https://")
-          path = URI(target).path
-          m = path.match(%r{/(\d{4,})/?\z})
-          return m[1] if m
+
+        url = target
+        url = "https://#{url}" if url =~ %r{\A(?:www\.)?lowes\.com/}i
+
+        return nil unless url.start_with?("http://", "https://")
+
+        uri = URI(url)
+        if uri.path == "/redir" && uri.query
+          inner = URI.decode_www_form(uri.query).assoc("u")&.last
+          return resolve_item_id(inner) if inner
         end
+
+        m = uri.path.match(%r{/(\d{4,})/?\z})
+        m && m[1]
+      rescue URI::InvalidURIError
         nil
       end
 

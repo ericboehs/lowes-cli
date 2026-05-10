@@ -30,9 +30,11 @@ minutes).
 | `quotes refresh <id>` | `client.refresh_quote` |
 | `quotes refresh-cookies` | `Client.refresh_cookies!` |
 
-`add` accepts either a numeric item-id (e.g. `28828201`) or a Lowe's product
-URL whose path ends in `/<digits>`. URL → omniItemId is a path-tail extract;
-no scraping or model lookup.
+`add` accepts either a numeric omniItemId or a Lowe's product URL whose path
+ends in `/<digits>`. The trailing-digits segment of a `/pd/<slug>/<digits>`
+URL **is** the omniItemId — no scraping or model lookup needed. The
+resolver also handles bare hosts (`lowes.com/pd/...`), strips query/fragment,
+and unwraps `lowes.com/redir?u=<encoded>` share links.
 
 ## API endpoints used (relative to `https://www.lowes.com/digitalpro/api/quote`)
 
@@ -76,8 +78,7 @@ also fails the user gets a `Lowes::Client::Error` with status code.
 ## Open
 
 - Web UI (`web.rb`) still references the old local-quote shape; it should be refactored to call the same `Lowes::Client`.
-- `add` does not yet accept arbitrary Lowe's URLs that route through redirects (e.g. `lowes.com/redir?u=...`). Only the canonical `/pd/<slug>/<id>` shape works.
-- `add` requires the `omniItemId`, which is **not** the same as the digit-tail of a `/pd/<slug>/<digits>` URL. The URL trailing digits are an SKU-ish `itemNumber`. We need a resolution step (likely `GET /purchase/api/product/search/items?searchTerms=<term>` or similar) that returns the real `omniItemId` before we can wire URL/itemNumber input on the CLI.
+- `add` does **not** translate the human-facing "Item #" (`itemNumber`, e.g. `28828201`) to an `omniItemId`. If a user pastes an item-number, the API returns `Missing product details for OmniItemId <n>`. A lookup step (likely `GET /digitalpro/api/product/search/items?searchTerms=<n>`) would close this gap, but the canonical PDP URL workflow already gets the right id from path-tail extraction.
 
 ## Pricing model (cartItems[*].priceInfo.prices)
 

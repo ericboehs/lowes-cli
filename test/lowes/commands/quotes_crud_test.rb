@@ -222,11 +222,42 @@ class QuotesCrudTest < Minitest::Test
     assert_equal "1000123456", add[2].first["productInfo"]["omniItemId"]
   end
 
+  def test_add_extracts_item_id_from_url_with_query
+    capture_io { @cmd.run(["add", "240", "https://www.lowes.com/pd/Foo/4747075?cm_mmc=foo"]) }
+    add = @stub.calls.find { |c| c.first == :add_items }
+    assert_equal "4747075", add[2].first["productInfo"]["omniItemId"]
+  end
+
+  def test_add_extracts_item_id_from_schemeless_url
+    capture_io { @cmd.run(["add", "240", "lowes.com/pd/Foo/4747075"]) }
+    add = @stub.calls.find { |c| c.first == :add_items }
+    assert_equal "4747075", add[2].first["productInfo"]["omniItemId"]
+  end
+
+  def test_add_unwraps_redir_url
+    redir = "https://www.lowes.com/redir?u=#{URI.encode_www_form_component("https://www.lowes.com/pd/Foo/9988776")}"
+    capture_io { @cmd.run(["add", "240", redir]) }
+    add = @stub.calls.find { |c| c.first == :add_items }
+    assert_equal "9988776", add[2].first["productInfo"]["omniItemId"]
+  end
+
+  def test_add_strips_whitespace
+    capture_io { @cmd.run(["add", "240", "  4747075  "]) }
+    add = @stub.calls.find { |c| c.first == :add_items }
+    assert_equal "4747075", add[2].first["productInfo"]["omniItemId"]
+  end
+
   def test_add_rejects_unparseable_target
     rc = nil
     _out, err = capture_io { rc = @cmd.run(["add", "240", "ABC-MODEL"]) }
     assert_equal 2, rc
-    assert_match(/numeric item-id/, err)
+    assert_match(/omniItemId|product URL/i, err)
+  end
+
+  def test_add_rejects_url_without_trailing_digits
+    rc = nil
+    capture_io { rc = @cmd.run(["add", "240", "https://www.lowes.com/c/Lighting"]) }
+    assert_equal 2, rc
   end
 
   def test_remove_calls_remove_item_when_forced
