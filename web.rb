@@ -862,8 +862,13 @@ __END__
   <h2 class="text-sm font-semibold text-zinc-700 dark:text-zinc-300 uppercase tracking-wide mb-3">Items (<%= (@quote['items'] || []).size %>)</h2>
   <ul class="divide-y divide-zinc-200 dark:divide-zinc-800">
     <% (@quote['items'] || []).each do |it| %>
-      <li class="py-3 first:pt-0 last:pb-0 flex justify-between gap-4">
-        <div class="min-w-0">
+      <li class="py-3 first:pt-0 last:pb-0 flex items-start gap-4">
+        <% if it['image_url'] %>
+          <img src="<%= h(proxy_image(it['image_url'])) %>" alt="" loading="lazy" class="w-16 h-16 rounded bg-zinc-100 dark:bg-zinc-800 object-contain shrink-0 ring-1 ring-zinc-200 dark:ring-zinc-800">
+        <% else %>
+          <div class="w-16 h-16 rounded bg-zinc-100 dark:bg-zinc-800 ring-1 ring-zinc-300 dark:ring-zinc-700 shrink-0"></div>
+        <% end %>
+        <div class="min-w-0 flex-1">
           <div class="text-zinc-900 dark:text-zinc-100 font-medium"><% if it['quantity'] %>x<%= it['quantity'] %> <% end %><%= h(it['title']) %></div>
           <div class="text-xs text-zinc-500 dark:text-zinc-400 font-mono mt-0.5">
             <% if it['model'] %>Model <%= h(it['model']) %><% end %>

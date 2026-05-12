@@ -45,6 +45,14 @@ module Lowes
       }
     end
 
+    # `productInfo.imageUrl` comes back as `/productimages/<uuid>/<n>.jpeg` —
+    # which 403s on www.lowes.com but is served from mobileimages.lowes.com.
+    def absolute_image_url(url)
+      return nil if url.nil? || url.empty?
+      return url if url.start_with?("http://", "https://")
+      "https://mobileimages.lowes.com#{url}"
+    end
+
     # `cartItems[*].itemSummary` is the authoritative per-line price source —
     # each line's discount % is its own (not the cart average), so prefer it
     # when present and fall back to `priceInfo.prices[]` only if it's empty.
@@ -68,7 +76,7 @@ module Lowes
         "item_id"         => pi["itemNumber"] || pi["omniItemId"],
         "url"             => pi["pdUrl"],
         "title"           => pi["productName"] || pi["productDescription"],
-        "image_url"       => pi["imageUrl"],
+        "image_url"       => absolute_image_url(pi["imageUrl"]),
         "quantity"        => qty,
         "unit_price"      => unit_paid,
         "unit_price_list" => unit_list,
