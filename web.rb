@@ -19,6 +19,12 @@ require 'erb'
 require 'date'
 require 'net/http'
 
+# Quotes are read live from lowes.com via the same client the CLI uses.
+$LOAD_PATH.unshift(File.expand_path('lib', __dir__))
+require 'lowes/config'
+require 'lowes/client'
+require 'lowes/quote_adapter'
+
 DATA_ROOT   = ENV['LOWES_DATA_ROOT'] || File.expand_path('~/.local/share/lowes')
 INDEX_PATH  = File.join(DATA_ROOT, 'index.json')
 MATERIALS   = File.join(DATA_ROOT, 'materials.json')
@@ -125,12 +131,24 @@ helpers do
     nil
   end
 
+  def lowes_client
+    Lowes::Config.load
+    self.class.instance_variable_get(:@lowes_client) ||
+      self.class.instance_variable_set(:@lowes_client,
+        Lowes::Client.from_storage_state(auto_refresh: true))
+  end
+
+  def online_quotes
+    (lowes_client.search['quotes'] || []).map { |q| Lowes::QuoteAdapter.to_row(q) }
+                                         .sort_by { |r| r['created'].to_s }.reverse
+  rescue Lowes::Client::Error
+    []
+  end
+
   def load_quote(id)
-    meta = index_data.dig('quotes', id) or return nil
-    path = File.join(DATA_ROOT, meta['file'])
-    return nil unless File.exist?(path)
-    JSON.parse(File.read(path))
-  rescue StandardError
+    detail = lowes_client.get_quote(id)['quoteDetail'] or return nil
+    Lowes::QuoteAdapter.detail_to_quote(detail)
+  rescue Lowes::Client::Error
     nil
   end
 
@@ -319,9 +337,7 @@ get '/orders/:id' do
 end
 
 get '/quotes' do
-  rows = (index_data['quotes'] || {}).map { |id, m| m.merge('quote_id' => id) }
-                                     .sort_by { |q| q['date'].to_s }.reverse
-  render_page :quotes, quotes: rows, title: 'Quotes'
+  render_page :quotes, quotes: online_quotes, title: 'Quotes'
 end
 
 get '/quotes/:id' do
@@ -795,7 +811,7 @@ __END__
 <h1 class="text-2xl font-semibold mb-4">Quotes</h1>
 <% if @quotes.empty? %>
   <div class="text-zinc-600 dark:text-zinc-400 text-sm border border-zinc-200 dark:border-zinc-800 rounded-lg p-6">
-    No quotes cached yet. Run <code class="text-xs bg-zinc-100 dark:bg-zinc-900 px-1.5 py-0.5 rounded">lowes quotes sync</code>.
+    No quotes — make sure Chrome is running with a signed-in lowes.com tab (try <code class="text-xs bg-zinc-100 dark:bg-zinc-900 px-1.5 py-0.5 rounded">bin/lowes quotes</code> in the terminal).
   </div>
 <% else %>
   <ul class="space-y-2">
@@ -828,9 +844,19 @@ __END__
   <p class="text-sm text-zinc-600 dark:text-zinc-400 mt-1">
     <%= relative_date(@quote['created'] || @quote['date']) %> ·
     <span class="font-semibold tabular-nums text-zinc-900 dark:text-zinc-100"><%= money(@quote['total']) %></span>
+    <% if @quote['subtotal_list'] && @quote['subtotal_list'] != @quote['subtotal'] %>
+      <span class="line-through tabular-nums"><%= money(@quote['subtotal_list']) %></span>
+      · <span class="text-emerald-700 dark:text-emerald-400">save <%= money(@quote['total_savings']) %> (<%= @quote['savings_pct'] %>%)</span>
+    <% end %>
     <% if @quote['status'] %>· <%= h(@quote['status']) %><% end %>
   </p>
-  <% if @quote['link'] %><a href="<%= h(@quote['link']) %>" target="_blank" rel="noopener" class="text-xs text-blue-700 dark:text-blue-400">View on lowes.com →</a><% end %>
+  <% if (s = @quote['savings_summary']) && !s.empty? %>
+    <p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">via <%= h(s.join(', ')) %></p>
+  <% end %>
+  <% if (gap = @quote['vsp_to_qualify']) && gap.to_f > 0 %>
+    <p class="text-xs text-amber-700 dark:text-amber-400 mt-1">↑ Add <%= money(gap) %> for a Member Volume Discount<% if @quote['vsp_threshold'] %> <span class="text-zinc-500">(threshold <%= money(@quote['vsp_threshold']) %>)</span><% end %></p>
+  <% end %>
+  <% if @quote['link'] %><a href="<%= h(@quote['link']) %>" target="_blank" rel="noopener" class="text-xs text-blue-700 dark:text-blue-400 mt-2 inline-block">View on lowes.com →</a><% end %>
 </div>
 <div class="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/40 p-5">
   <h2 class="text-sm font-semibold text-zinc-700 dark:text-zinc-300 uppercase tracking-wide mb-3">Items (<%= (@quote['items'] || []).size %>)</h2>
@@ -838,10 +864,18 @@ __END__
     <% (@quote['items'] || []).each do |it| %>
       <li class="py-3 first:pt-0 last:pb-0 flex justify-between gap-4">
         <div class="min-w-0">
-          <div class="text-zinc-900 dark:text-zinc-100 font-medium"><%= h(it['title']) %></div>
-          <% if it['model'] %><div class="text-xs text-zinc-500 dark:text-zinc-400 font-mono">Model <%= h(it['model']) %></div><% end %>
+          <div class="text-zinc-900 dark:text-zinc-100 font-medium"><% if it['quantity'] %>x<%= it['quantity'] %> <% end %><%= h(it['title']) %></div>
+          <div class="text-xs text-zinc-500 dark:text-zinc-400 font-mono mt-0.5">
+            <% if it['model'] %>Model <%= h(it['model']) %><% end %>
+            <% if it['item_id'] %><% if it['model'] %> · <% end %>Item <%= h(it['item_id']) %><% end %>
+          </div>
+          <% if it['unit_price_list'] && it['unit_price'] && it['unit_price_list'] != it['unit_price'] %>
+            <div class="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+              <%= money(it['unit_price']) %>/ea <span class="line-through"><%= money(it['unit_price_list']) %></span> · −<%= it['discount_pct'] %>%
+            </div>
+          <% end %>
         </div>
-        <div class="font-medium tabular-nums shrink-0"><%= money(it['price']) %></div>
+        <div class="font-medium tabular-nums shrink-0"><%= money(it['line_total'] || it['unit_price']) %></div>
       </li>
     <% end %>
   </ul>
