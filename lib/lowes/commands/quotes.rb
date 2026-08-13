@@ -267,11 +267,19 @@ module Lowes
 
       # The add endpoint 200s with the whole quote echoed back, so `add_items`
       # returning is not proof the line landed — finding it in cartItems is.
+      #
+      # Adding an item the quote already carries does NOT merge into the existing
+      # line; Lowe's appends a second line for the same omniItemId. cartItems
+      # comes back oldest-first, so matching on omniItemId alone finds the stale
+      # line and reports its quantity. `lastUpdatedCartItem` names the line the
+      # request actually touched — that's the one to report on.
       def find_cart_item(resp, item_id)
         detail = resp.is_a?(Hash) ? (resp["quoteDetail"] || resp) : nil
         items  = detail.is_a?(Hash) ? detail["cartItems"] : nil
         return nil unless items.is_a?(Hash)
-        items.find { |_, it| it.to_h.dig("productInfo", "omniItemId").to_s == item_id.to_s }
+
+        matching = items.select { |_, it| it.to_h.dig("productInfo", "omniItemId").to_s == item_id.to_s }
+        matching.assoc(detail["lastUpdatedCartItem"].to_s) || matching.first
       end
 
       def report_added(pair, resp, quote_id, requested_qty)
@@ -285,11 +293,29 @@ module Lowes
         end
         warn msg
 
-        # An existing line accumulates, so only a shortfall is a real problem.
-        if line["quantity"] < requested_qty
+        if line["quantity"] != requested_qty
           warn "  ! asked for qty #{requested_qty}, quote shows #{line["quantity"]}"
         end
+
+        # Quantities across duplicate lines don't merge, so the quote will list
+        # the same item twice and the Pro Desk reads that as two separate orders.
+        if (dupes = sibling_lines(resp, pair)).positive?
+          lines = dupes > 1 ? "#{dupes} other lines" : "1 other line"
+          verb  = dupes > 1 ? "carry" : "carries"
+          warn "  ! #{lines} on this quote already #{verb} this item — " \
+               "quantities do not merge; consolidate with `quotes set --qty` + `quotes remove`"
+        end
+
         item_errors(pair.last).each { |m| warn "  ! #{m}" }
+      end
+
+      # Other lines carrying the same omniItemId as the one just added.
+      def sibling_lines(resp, pair)
+        detail = resp["quoteDetail"] || resp
+        omni   = pair.last.to_h.dig("productInfo", "omniItemId").to_s
+        (detail["cartItems"] || {}).count do |line_id, it|
+          line_id != pair.first && it.to_h.dig("productInfo", "omniItemId").to_s == omni
+        end
       end
 
       # Lowe's accepts an add even when the item can't be fulfilled at the zipped-in

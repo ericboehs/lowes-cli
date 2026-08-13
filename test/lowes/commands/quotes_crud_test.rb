@@ -54,7 +54,7 @@ class QuotesCrudTest < Minitest::Test
     end
 
     # Knobs for the add-verification paths.
-    attr_accessor :add_raises, :add_drops_item, :add_qty_override, :add_alerts
+    attr_accessor :add_raises, :add_drops_item, :add_qty_override, :add_alerts, :add_existing_qty
 
     # Mirrors the live API: a 200 echoes the whole quote back with the new line
     # in cartItems, which is the only proof the add actually landed.
@@ -63,18 +63,22 @@ class QuotesCrudTest < Minitest::Test
       raise @add_raises if @add_raises
       omni = items.first["productInfo"]["omniItemId"]
       qty  = @add_qty_override || items.first["quantity"]
-      cart = if @add_drops_item
-        {}
-      else
-        { "LINE-#{omni}" => {
-          "quantity" => qty,
-          "productInfo" => { "omniItemId" => omni, "itemNumber" => "6634", "productDescription" => "Concrete Form Tube" },
-          "priceInfo" => { "prices" => [{ "priceType" => "FINAL", "value" => 23.48 }] },
-          "alerts" => @add_alerts || {}
-        } }
-      end
+      cart = {}
+      # Re-adding an item appends a second line instead of merging, and the
+      # stale line comes back first — the ordering the live API uses.
+      cart["LINE-#{omni}-old"] = cart_line(omni, @add_existing_qty) if @add_existing_qty
+      cart["LINE-#{omni}"] = cart_line(omni, qty, @add_alerts) unless @add_drops_item
       { "quoteDetail" => { "quoteId" => id, "cartItems" => cart,
+                           "lastUpdatedCartItem" => (@add_drops_item ? nil : "LINE-#{omni}"),
                            "cartSummary" => { "grandTotal" => (23.48 * qty).round(2).to_s } } }
+    end
+
+    def cart_line(omni, qty, alerts = nil)
+      { "quantity" => qty,
+        "productInfo" => { "omniItemId" => omni, "itemNumber" => "6634",
+                           "productDescription" => "Concrete Form Tube" },
+        "priceInfo" => { "prices" => [{ "priceType" => "FINAL", "value" => 23.48 }] },
+        "alerts" => alerts || {} }
     end
 
     def remove_item(id, line_id, **opts)
@@ -337,6 +341,26 @@ class QuotesCrudTest < Minitest::Test
     cmd = Lowes::Commands::Quotes.new({ json: false, quiet: false, verbose: false }, online_client: @stub)
     _out, err = capture_io { cmd.run(["add", "240", "5002133407", "--qty", "5"]) }
     assert_match(/asked for qty 5, quote shows 1/, err)
+  end
+
+  # Regression: cartItems is ordered oldest-first, so matching on omniItemId
+  # alone picked the stale line and cried shortfall on a perfectly good add.
+  def test_add_reports_the_line_it_just_created_not_the_stale_duplicate
+    @stub.add_existing_qty = 18
+    cmd = Lowes::Commands::Quotes.new({ json: false, quiet: false, verbose: false }, online_client: @stub)
+    rc = nil
+    _out, err = capture_io { rc = cmd.run(["add", "240", "5002133407", "--qty", "27"]) }
+    assert_equal 0, rc
+    assert_match(/Concrete Form Tube x27/, err)
+    refute_match(/asked for qty/, err, "27 landed — the 18 is a separate, older line")
+  end
+
+  def test_add_warns_that_a_duplicate_line_does_not_merge
+    @stub.add_existing_qty = 18
+    cmd = Lowes::Commands::Quotes.new({ json: false, quiet: false, verbose: false }, online_client: @stub)
+    _out, err = capture_io { cmd.run(["add", "240", "5002133407", "--qty", "27"]) }
+    assert_match(/1 other line on this quote already carries this item/, err)
+    assert_match(/quantities do not merge/, err)
   end
 
   def test_add_surfaces_item_level_availability_errors
