@@ -43,7 +43,8 @@ class QuotesCrudTest < Minitest::Test
 
     def delete_quote(id)
       @calls << [:delete, id]
-      { "ok" => true }
+      @details.delete(id)
+      nil
     end
 
     def duplicate_quote(id, **kwargs)
@@ -52,13 +53,33 @@ class QuotesCrudTest < Minitest::Test
       { "quoteId" => "#{id}-copy", "quoteDescription" => kwargs[:description] }
     end
 
+    # Knobs for the add-verification paths.
+    attr_accessor :add_raises, :add_drops_item, :add_qty_override, :add_alerts
+
+    # Mirrors the live API: a 200 echoes the whole quote back with the new line
+    # in cartItems, which is the only proof the add actually landed.
     def add_items(id, items, **opts)
       @calls << [:add_items, id, items, opts]
-      { "ok" => true }
+      raise @add_raises if @add_raises
+      omni = items.first["productInfo"]["omniItemId"]
+      qty  = @add_qty_override || items.first["quantity"]
+      cart = if @add_drops_item
+        {}
+      else
+        { "LINE-#{omni}" => {
+          "quantity" => qty,
+          "productInfo" => { "omniItemId" => omni, "itemNumber" => "6634", "productDescription" => "Concrete Form Tube" },
+          "priceInfo" => { "prices" => [{ "priceType" => "FINAL", "value" => 23.48 }] },
+          "alerts" => @add_alerts || {}
+        } }
+      end
+      { "quoteDetail" => { "quoteId" => id, "cartItems" => cart,
+                           "cartSummary" => { "grandTotal" => (23.48 * qty).round(2).to_s } } }
     end
 
     def remove_item(id, line_id, **opts)
       @calls << [:remove_item, id, line_id, opts]
+      (@details.dig(id, "cartItems") || {}).delete(line_id)
       { "ok" => true }
     end
 
@@ -291,6 +312,68 @@ class QuotesCrudTest < Minitest::Test
     rc = nil
     capture_io { rc = @cmd.run(["add", "240", "https://www.lowes.com/c/Lighting"]) }
     assert_equal 2, rc
+  end
+
+  def test_add_reports_what_landed_and_the_new_total
+    cmd = Lowes::Commands::Quotes.new({ json: false, quiet: false, verbose: false }, online_client: @stub)
+    rc = nil
+    _out, err = capture_io { rc = cmd.run(["add", "240", "5002133407", "--qty", "2"]) }
+    assert_equal 0, rc
+    assert_match(/Concrete Form Tube x2/, err)
+    assert_match(/line \$46\.96/, err)
+    assert_match(/quote 240 now \$46\.96/, err)
+  end
+
+  def test_add_fails_when_item_is_absent_from_the_echoed_quote
+    @stub.add_drops_item = true
+    rc = nil
+    _out, err = capture_io { rc = @cmd.run(["add", "240", "5002133407"]) }
+    assert_equal 1, rc, "a 200 that did not add the item must not report success"
+    assert_match(/not on quote 240/, err)
+  end
+
+  def test_add_warns_when_quantity_falls_short
+    @stub.add_qty_override = 1
+    cmd = Lowes::Commands::Quotes.new({ json: false, quiet: false, verbose: false }, online_client: @stub)
+    _out, err = capture_io { cmd.run(["add", "240", "5002133407", "--qty", "5"]) }
+    assert_match(/asked for qty 5, quote shows 1/, err)
+  end
+
+  def test_add_surfaces_item_level_availability_errors
+    @stub.add_alerts = { "ITM-2048" => { "code" => "ITM-2048", "type" => "ERROR",
+                                         "message" => "Item unavailable. Remove to check out." } }
+    cmd = Lowes::Commands::Quotes.new({ json: false, quiet: false, verbose: false }, online_client: @stub)
+    rc = nil
+    _out, err = capture_io { rc = cmd.run(["add", "240", "5002133407"]) }
+    assert_equal 0, rc, "the line did land — an availability alert is a warning, not a failure"
+    assert_match(/Item unavailable/, err)
+  end
+
+  def test_add_explains_the_item_number_mixup_on_a_500
+    @stub.add_raises = Lowes::Client::Error.new("HTTP 500", status: 500)
+    rc = nil
+    _out, err = capture_io { rc = @cmd.run(["add", "240", "6634"]) }
+    assert_equal 1, rc
+    assert_match(/rejected 6634/, err)
+    assert_match(/store item number rather than an omniItemId/, err)
+  end
+
+  def test_delete_fails_when_the_quote_survives
+    @stub.add_detail("12345", { "quoteId" => "12345", "cartItems" => {}, "cartSummary" => {} })
+    def @stub.delete_quote(id) = @calls << [:delete, id] # no-op delete
+    rc = nil
+    _out, err = capture_io { rc = @cmd.run(["delete", "12345", "-y"]) }
+    assert_equal 1, rc
+    assert_match(/still exists/, err)
+  end
+
+  def test_remove_fails_when_the_line_survives
+    @stub.add_detail("240", { "quoteId" => "240", "cartItems" => { "line-99" => { "quantity" => 1 } } })
+    def @stub.remove_item(id, line_id, **opts) = @calls << [:remove_item, id, line_id, opts] # no-op
+    rc = nil
+    _out, err = capture_io { rc = @cmd.run(["remove", "240", "line-99", "-y"]) }
+    assert_equal 1, rc
+    assert_match(/still on quote 240/, err)
   end
 
   def test_remove_calls_remove_item_when_forced

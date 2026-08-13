@@ -170,8 +170,22 @@ module Lowes
           return 0 unless %w[y yes].include?($stdin.gets&.strip&.downcase)
         end
         online_client.delete_quote(id)
+        unless quote_gone?(id)
+          warn "quotes delete: #{id} still exists after the delete call."
+          return 1
+        end
         warn "deleted #{id}" unless @global[:quiet]
         0
+      end
+
+      # delete_quote answers with an empty body, so the only confirmation is that
+      # the quote itself now 404s. Do not check `quotes list` instead — the search
+      # index it reads lags the quote by minutes and will still show the deleted row.
+      def quote_gone?(id)
+        online_client.get_quote(id)
+        false
+      rescue Lowes::Client::Error => e
+        e.status.to_i == 404
       end
 
       def clone(argv)
@@ -235,9 +249,68 @@ module Lowes
           end
         end
 
-        online_client.add_items(id, [{ "productInfo" => { "omniItemId" => item_id }, "quantity" => qty }])
-        warn "added #{item_id} (qty #{qty}) to #{id}" unless @global[:quiet]
+        begin
+          resp = online_client.add_items(id, [{ "productInfo" => { "omniItemId" => item_id }, "quantity" => qty }])
+        rescue Lowes::Client::Error => e
+          return report_add_rejected(e, id, item_id)
+        end
+
+        pair = find_cart_item(resp, item_id)
+        unless pair
+          warn "quotes add: Lowe's accepted the request but #{item_id} is not on quote #{id} — nothing was added."
+          return 1
+        end
+
+        report_added(pair, resp, id, qty) unless @global[:quiet]
         0
+      end
+
+      # The add endpoint 200s with the whole quote echoed back, so `add_items`
+      # returning is not proof the line landed — finding it in cartItems is.
+      def find_cart_item(resp, item_id)
+        detail = resp.is_a?(Hash) ? (resp["quoteDetail"] || resp) : nil
+        items  = detail.is_a?(Hash) ? detail["cartItems"] : nil
+        return nil unless items.is_a?(Hash)
+        items.find { |_, it| it.to_h.dig("productInfo", "omniItemId").to_s == item_id.to_s }
+      end
+
+      def report_added(pair, resp, quote_id, requested_qty)
+        line   = Lowes::QuoteAdapter.line_to_item(*pair)
+        detail = resp["quoteDetail"] || resp
+        f      = Lowes::Formatter.new
+
+        msg = "added #{line["title"]} x#{line["quantity"]} — line #{f.send(:format_money, line["line_total"])}"
+        if (total = detail.dig("cartSummary", "grandTotal"))
+          msg += " · quote #{quote_id} now #{f.send(:format_money, total.to_f)}"
+        end
+        warn msg
+
+        # An existing line accumulates, so only a shortfall is a real problem.
+        if line["quantity"] < requested_qty
+          warn "  ! asked for qty #{requested_qty}, quote shows #{line["quantity"]}"
+        end
+        item_errors(pair.last).each { |m| warn "  ! #{m}" }
+      end
+
+      # Lowe's accepts an add even when the item can't be fulfilled at the zipped-in
+      # store, and only says so in the line's own alerts map.
+      def item_errors(item)
+        (item["alerts"] || {}).values
+                              .select { |a| a["type"].to_s.upcase == "ERROR" }
+                              .filter_map { |a| a["message"] || a["srcMsg"] }
+      end
+
+      # A 5xx here is nearly always the item-number/omniItemId mixup: `lowes list`
+      # and `show` surface productInfo.itemNumber (e.g. 6634), but the quote API
+      # only accepts the omniItemId (e.g. 5002133407) — pdUrl's last path segment.
+      def report_add_rejected(err, quote_id, item_id)
+        warn "quotes add: Lowe's rejected #{item_id} for quote #{quote_id} (HTTP #{err.status})."
+        if err.status.to_i >= 500
+          warn "  #{item_id} may be a store item number rather than an omniItemId."
+          warn "  Pass the product URL instead — the omniItemId is its last path segment:"
+          warn "    lowes quotes add #{quote_id} https://www.lowes.com/pd/<slug>/<omniItemId>"
+        end
+        1
       end
 
       def url_like?(s)
@@ -283,8 +356,19 @@ module Lowes
           return 0 unless %w[y yes].include?($stdin.gets&.strip&.downcase)
         end
         online_client.remove_item(id, line_id)
+        if line_present?(id, line_id)
+          warn "quotes remove: line #{line_id} is still on quote #{id}."
+          return 1
+        end
         warn "removed line #{line_id}" unless @global[:quiet]
         0
+      end
+
+      def line_present?(quote_id, line_id)
+        detail = online_client.get_quote(quote_id)["quoteDetail"] || {}
+        (detail["cartItems"] || {}).key?(line_id.to_s)
+      rescue Lowes::Client::Error
+        false
       end
 
       def pick_line_id_interactive(quote_id)
