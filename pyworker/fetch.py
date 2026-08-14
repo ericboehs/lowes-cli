@@ -196,11 +196,15 @@ ORDER_DETAIL_EXTRACT_JS = r"""
 
   const anchors = Array.from(document.querySelectorAll('a[href*="/pd/"]'))
     .filter(a => !isRecAnchor(a));
+  // Dedupe by row element, not by href. A row holds two anchors for the same
+  // product (image column and title column) and those must collapse — but an
+  // order that bought the same item twice gets two separate rows with the
+  // same href, and those are two real lines. Keying on href dropped the
+  // second one and made the order read as cheaper than it was.
   const seen = new Set();
   const items = [];
   for (const a of anchors) {
     const href = a.href;
-    if (seen.has(href)) continue;
 
     let row = null, el = a, hops = 0, foundQty = false;
     while (el && el.parentElement && hops < 14) {
@@ -226,7 +230,8 @@ ORDER_DETAIL_EXTRACT_JS = r"""
       }
     }
     if (!row) continue;
-    seen.add(href);
+    if (seen.has(row)) continue;
+    seen.add(row);
 
     const text = row ? (row.innerText || '') : '';
     const titleEl = a.querySelector('img[alt]');
@@ -250,8 +255,18 @@ ORDER_DETAIL_EXTRACT_JS = r"""
       .filter(n => !isNaN(n));
     const linePrices = [];
     {
-      const re = /\$\s*([0-9,]+(?:\.\d{2})?)(?!\s*\/\s*ea)/gi;
+      // "Saved $12.34" sits in the same row text and is not a price anything
+      // was ever sold for. It only matters when the savings exceed what was
+      // paid: line_was takes the smallest amount above line_total, so a big
+      // enough Saved figure outranks the real strikethrough and gets stored
+      // as the pre-discount line total.
+      const savingsLabel = /sav(?:ings|ed|e)\b[\s:]*$/i;
+      // (?![0-9.]) stops the amount backtracking to a shorter number so the
+      // /ea guard can be satisfied: without it "$5.00 /ea" matches as "5.0"
+      // and a per-unit was-price lands in the line-total pool.
+      const re = /\$\s*([0-9,]+(?:\.\d{2})?)(?![0-9.])(?!\s*\/\s*ea)/gi;
       let m; while ((m = re.exec(text)) !== null) {
+        if (savingsLabel.test(text.slice(Math.max(0, m.index - 24), m.index))) continue;
         const v = parseFloat(m[1].replace(/,/g, ''));
         if (!isNaN(v)) linePrices.push(v);
       }
