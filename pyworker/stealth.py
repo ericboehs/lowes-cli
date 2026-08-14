@@ -3,35 +3,59 @@ Shared Playwright setup for the lowes worker.
 
 Two modes:
 
-1. **CDP attach** (preferred when Lowe's bot-detection is active) — connect
-   to a real Chrome.app the user launched with `--remote-debugging-port=9222`.
-   This uses their actual Chrome binary and a real user-data-dir, which
-   passes Lowe's "We're unable to sign you in right now" check that vanilla
-   automated Chromium fails. Use `lowes chrome-start` to launch.
+1. **CDP attach** (preferred, and what every command actually uses) — connect
+   to the Chrome that `lowes chrome-start` launched with
+   `--remote-debugging-port=9222`. That Chrome is the real binary with a real
+   user-data-dir, started directly rather than through Playwright's launcher,
+   so it was never in automation mode: `navigator.webdriver` is false without
+   any patching. Headless or headed is decided on *that* command line, not
+   here — see `lib/lowes/commands/chrome_start.rb`. This module attaches to
+   whatever is on the port.
 
 2. **Persistent context fallback** — vanilla Playwright + a persistent
-   user-data-dir under the cache directory. Fine for sites that don't fight
-   automation.
+   user-data-dir under the cache directory. Weaker, because Playwright turns
+   automation mode on over the debugger (`Emulation.setAutomationOverride`)
+   where no command-line filtering can reach it; the blink flag below switches
+   the feature off outright, which is the part that does reach it.
 
 Selection: if `LOWES_CDP_URL` is set (or the default debugging port is
 listening), we attach. Otherwise we launch our own.
+
+Whichever path runs, a headless Chrome has to be told what to call itself.
+Left alone it advertises `HeadlessChrome/<version>` in its own User-Agent and
+Akamai answers 403 Access Denied at the edge, before the sensor runs and
+before any fingerprint could matter. Measured on lowes.com, cold profile:
+`--headless` alone gets "Access Denied" and no `_abck` at all; `--headless`
+plus a User-Agent naming the version the binary actually is gets the real
+homepage and a validated `_abck` in about three seconds.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import subprocess
+import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+
+CHROME_BINARIES = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
 )
 
-DEFAULT_CDP_URL = "http://127.0.0.1:9222"
+PLATFORMS = {"darwin": "Macintosh; Intel Mac OS X 10_15_7", "linux": "X11; Linux x86_64"}
+
+# Last resort only. A UA naming a Chrome older than the engine behind it is a
+# worse tell than `HeadlessChrome` was — that mismatch is the thing a sensor is
+# built to notice — so this is used only when the binary refuses to say.
+FALLBACK_VERSION = "151"
 
 
 def sync_playwright_module():
@@ -59,6 +83,44 @@ def cdp_endpoint() -> str | None:
     return None
 
 
+def chrome_binary() -> str | None:
+    if (env := os.environ.get("LOWES_CHROME_BINARY")):
+        return env if os.access(env, os.X_OK) else None
+    for path in CHROME_BINARIES:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def installed_version(binary: str | None = None) -> str:
+    """The major version the Chrome binary reports about itself.
+
+    Asked of the binary rather than hardcoded, so the string stays true across
+    Chrome updates instead of quietly becoming a lie.
+    """
+    binary = binary or chrome_binary()
+    if not binary:
+        return FALLBACK_VERSION
+    try:
+        out = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return FALLBACK_VERSION
+    match = re.search(r"(\d+)", out)
+    return match.group(1) if match else FALLBACK_VERSION
+
+
+def user_agent() -> str:
+    if (env := os.environ.get("LOWES_USER_AGENT")):
+        return env
+    platform = PLATFORMS.get("darwin" if sys.platform == "darwin" else "linux")
+    return (
+        f"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{installed_version()}.0.0.0 Safari/537.36"
+    )
+
+
 def open_stealth_context(
     p: Any,
     user_data_dir: Path,
@@ -69,8 +131,8 @@ def open_stealth_context(
 ):
     """Open a Chromium context.
 
-    Tries CDP attach first (real user Chrome). Falls back to a persistent
-    Chromium context. Caller closes via `context.close()`.
+    Tries CDP attach first (the Chrome `lowes chrome-start` launched). Falls
+    back to a persistent Chromium context. Caller closes via `context.close()`.
     """
     cdp = cdp_endpoint()
     if cdp:
@@ -83,11 +145,25 @@ def open_stealth_context(
         return browser.new_context()
 
     user_data_dir.mkdir(parents=True, exist_ok=True)
-    return p.chromium.launch_persistent_context(
+    # `--user-agent` rather than the `user_agent=` context option on purpose:
+    # the option is a CDP-level override that leaves `sec-ch-ua` reporting
+    # whatever the binary is, contradicting the header. Set at launch, the
+    # client hints follow the flag.
+    args = ["--disable-blink-features=AutomationControlled"]
+    if not headed:
+        args.append(f"--user-agent={user_agent()}")
+    options: dict[str, Any] = dict(
         user_data_dir=str(user_data_dir),
         headless=not headed,
         viewport=viewport or {"width": 1366, "height": 900},
         locale=locale,
         timezone_id=timezone_id,
-        user_agent=USER_AGENT,
+        args=args,
     )
+    # The real binary, not Playwright's bundled "Chrome for Testing" — a
+    # different build than the one measured to pass, and testing the wrong
+    # binary answers the wrong question.
+    try:
+        return p.chromium.launch_persistent_context(channel="chrome", **options)
+    except Exception:  # noqa: BLE001 — no Chrome installed; bundled Chromium is the fallback
+        return p.chromium.launch_persistent_context(**options)
