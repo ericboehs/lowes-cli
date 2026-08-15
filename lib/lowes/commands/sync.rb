@@ -54,7 +54,7 @@ module Lowes
           known_order_ids: known_ids
         )
 
-        orders.each { |o| store.write_order(o) }
+        orders.each { |o| store.write_order(o, detailed: full_details) }
         store.commit_index!
 
         append_sync_log(years, orders.size)

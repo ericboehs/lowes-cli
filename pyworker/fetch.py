@@ -677,6 +677,24 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
                 detail = page.evaluate(ORDER_DETAIL_EXTRACT_JS) or {}
                 if detail.get("items"):
                     o["items"] = detail["items"]
+                else:
+                    # The one failure here that never raises: the page loads,
+                    # the extractor runs, and there is simply nothing on it.
+                    # Falling through leaves the order with whatever the list
+                    # page gave — usually nothing — and the sync reports a
+                    # clean run over an order it stored empty.
+                    #
+                    # Two different things land here. Lowe's serves a bare
+                    # "Order Details" shell for some older orders, with no
+                    # line content at all (measured: same empty result from
+                    # the pre-rewrite extractor, so it is their page, not our
+                    # selectors). And sometimes the detail page just hadn't
+                    # finished rendering — the same order re-read moments
+                    # later gives the full list. Only the second is worth
+                    # retrying, and telling them apart needs the message.
+                    emit("log", level="warn",
+                         msg=f"no line items on the detail page for {o.get('order_id')}; "
+                             "stored without them")
                 for k in ("status", "subtotal", "estimated_tax", "total_paid", "ship_to", "payment_method_last_4"):
                     if detail.get(k) is not None:
                         o[k] = detail[k]
