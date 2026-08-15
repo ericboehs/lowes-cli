@@ -66,6 +66,10 @@ SEARCH_URL_TEMPLATE = "https://www.lowes.com/search?searchTerm={q}"
 PRODUCT_URL_TEMPLATE = "https://www.lowes.com/pd/{item_id}"
 
 HOME_URL = "https://www.lowes.com/"
+
+# What `/account/orders` will show in one view no matter how it is filtered.
+# The quarterly chunking in `fetch_orders` exists to stay under it.
+ORDERS_PER_VIEW_CAP = 50
 SIGN_IN_BUTTON_SELECTORS = (
     'a[href*="signin" i], a[href*="login" i], '
     'button:has-text("Sign In"), a:has-text("Sign In")'
@@ -622,6 +626,18 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
                      msg=f"orders extract failed for {start}..{end}: {e}")
                 continue
 
+            # The quarterly chunking exists because Lowe's caps a view at 50.
+            # A quarter that comes back with exactly 50 is the cap answering,
+            # not the quarter ending — and the orders past it are dropped with
+            # no error. Busiest quarter on record here is 39, so this has not
+            # bitten yet; the point is to hear about it when it does rather
+            # than to find out from a missing order years later.
+            if len(chunk_orders) >= ORDERS_PER_VIEW_CAP:
+                emit("log", level="warn",
+                     msg=f"{start}..{end} returned {len(chunk_orders)} orders, at or past "
+                         f"Lowe's {ORDERS_PER_VIEW_CAP}-per-view cap; that quarter needs "
+                         "splitting or orders are being dropped")
+
             for o in chunk_orders:
                 oid = o.get("order_id")
                 if not oid or oid in seen_ids:
@@ -984,6 +1000,14 @@ def _scroll_to_bottom(page: Any, max_steps: int = 25, settle_ms: int = 400) -> N
             page.evaluate(f"() => window.scrollTo(0, {h})")
             page.wait_for_timeout(settle_ms)
             last = h
+        else:
+            # Ran out of steps while the page was still getting taller, which
+            # is indistinguishable from having reached the bottom by the time
+            # the extractor runs. A cap that truncates quietly reads exactly
+            # like complete coverage, so it has to say when it bites.
+            emit("log", level="warn",
+                 msg=f"stopped scrolling after {max_steps} steps and the page was still "
+                     "growing; whatever is below that point was not collected")
     except Exception as e:  # noqa: BLE001
         # Everything below the fold is lazy-loaded, so a failure here means the
         # extractors run against a short page and report a confident partial
