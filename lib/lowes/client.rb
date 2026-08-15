@@ -79,7 +79,10 @@ module Lowes
     def self.start_chrome!
       require_relative "chrome"
       require_relative "commands/chrome_start"
-      return unless File.exist?(Lowes::Commands::ChromeStart::CHROME_APP)
+      # No File.exist? check here: ChromeStart resolves --binary and
+      # browser.binary before falling back to CHROME_APP, so testing that
+      # constant would silently return nil for anyone on Linux or with a
+      # configured binary, and the caller would then blame the 15s timeout.
       Lowes::Commands::ChromeStart.new(silent: true).run(
         ["--url", "https://www.lowes.com/quotes",
          Lowes::Chrome.headless_default? ? "--headless" : "--headed"]

@@ -22,9 +22,14 @@ module Lowes
     # The version is read from the binary rather than frozen here: a UA naming
     # a Chrome that doesn't match the engine behind it is a worse tell than
     # `HeadlessChrome` was, and a constant becomes exactly that on the next
-    # Chrome release. Everything that has to name a browser — the headless
-    # launch flag, and the curl-side client borrowing that browser's cookies —
-    # asks here, so the two cannot drift apart.
+    # Chrome release.
+    #
+    # Everything that has to name a browser asks here: the headless launch
+    # flag, the client borrowing that browser's cookies, and — via
+    # LOWES_USER_AGENT, exported in Lowes::Worker#worker_env — the Python
+    # worker's no-CDP fallback, which otherwise builds its own from its own
+    # platform table in pyworker/stealth.py. That export is the only thing
+    # keeping the two tables from drifting, so it travels with this comment.
     USER_AGENT = "Mozilla/5.0 (%<platform>s) AppleWebKit/537.36 (KHTML, like Gecko) " \
                  "Chrome/%<version>s.0.0.0 Safari/537.36".freeze
 
@@ -39,8 +44,13 @@ module Lowes
     module_function
 
     def user_agent(binary = nil)
-      configured = browser_config["user_agent"]
-      return configured if configured
+      configured = browser_config["user_agent"].to_s.strip
+      unless configured.empty?
+        # Worth saying out loud rather than silently honouring: this is the
+        # one string whose whole job is to not contain that token.
+        warn "lowes: browser.user_agent contains HeadlessChrome — Akamai refuses it" if configured.include?("HeadlessChrome")
+        return configured
+      end
 
       binary ||= browser_config["binary"] || CHROME_APP
       format(USER_AGENT, platform: platform, version: installed_version(binary))
@@ -82,10 +92,19 @@ module Lowes
     # puts the window back.
     def headless_default?
       env = ENV["LOWES_HEADLESS"].to_s
-      return !FALSEY.include?(env.downcase) unless env.empty?
+      return truthy?(env) unless env.empty?
 
       configured = browser_config["headless"]
-      configured.nil? ? true : !!configured
+      configured.nil? ? true : truthy?(configured)
+    end
+
+    # One coercion for both sources. `"headless": "false"` — a quoted JSON
+    # boolean, one of the easier config mistakes to make — is truthy to `!!`,
+    # so reading it that way would hand back headless to someone who had just
+    # written the word false to escape it.
+    def truthy?(value)
+      return value unless value.is_a?(String) || value.is_a?(Numeric)
+      !FALSEY.include?(value.to_s.strip.downcase)
     end
 
     # Returns true if Chrome is up (already-running or just-started),
@@ -96,7 +115,12 @@ module Lowes
       require_relative "commands/chrome_start"
       headless = headless_default? if headless.nil?
       warn("lowes: starting Chrome#{" (headless)" if headless} (no CDP on 9222)") unless quiet
-      Lowes::Commands::ChromeStart.new(silent: quiet).run([headless ? "--headless" : "--headed"])
+      # A non-zero return means nothing was spawned (no binary, or no User-
+      # Agent could be built). Polling a port nothing is coming up on for 20s
+      # buries the message ChromeStart already printed.
+      status = Lowes::Commands::ChromeStart.new(silent: quiet).run([headless ? "--headless" : "--headed"])
+      return false unless status.to_i.zero?
+
       wait_for_cdp
     end
 
@@ -109,7 +133,17 @@ module Lowes
     # user-data-dir. One that is merely on the port belongs to somebody else.
     def ensure_headed(quiet: false)
       return ensure_started(quiet: quiet, headless: false) unless cdp_reachable?
-      return true unless running_headless?
+
+      case running_headless?
+      when false then return true
+      when nil
+        # Something is serving CDP but it is not ours to restart. Say so: if
+        # it happens to be headless, the sign-in prompt below never appears
+        # and the wait that follows is the timeout this method exists to
+        # prevent.
+        warn("lowes: Chrome on 9222 isn't one we started (different --profile?) — leaving it alone; sign in there if it has a window") unless quiet
+        return true
+      end
 
       warn("lowes: Chrome on 9222 is headless — restarting it with a window") unless quiet
       return false unless quit_ours
@@ -126,7 +160,7 @@ module Lowes
     end
 
     def running_argv(profile: DEFAULT_PROFILE_DIR)
-      processes.find do |line|
+      (processes || []).find do |line|
         line.include?("--user-data-dir=#{profile}") &&
           line.include?("--remote-debugging-port=") &&
           !line.include?("--type=") # renderer/GPU helpers inherit the profile flag
@@ -136,17 +170,27 @@ module Lowes
     # A seam, and an honest one: nothing else on the machine can answer "how
     # was that process started". `-ww` because macOS `ps` truncates argv to the
     # terminal width otherwise, and the flag we are looking for is at the end.
+    # nil, not [], when ps itself fails: "no Chrome of ours is running" and
+    # "we could not find out" lead to opposite decisions here — one says go
+    # ahead and launch, the other says do not signal anything.
     def processes
       IO.popen(["ps", "-axww", "-o", "command="], &:read).lines
-    rescue SystemCallError
-      []
+    rescue SystemCallError => e
+      warn "lowes: could not list processes (#{e.message})"
+      nil
     end
 
-    # Non-fatal on purpose: "no config yet" is a normal state for a browser
-    # that is only being asked whether to open a window.
+    # "No config yet" is a normal state for a browser that is only being asked
+    # whether to open a window, so that one is silent. A malformed config is
+    # not: swallowing it would force headless and drop browser.binary and
+    # browser.user_agent, all three without a word.
     def browser_config
       Lowes::Config.load.browser
-    rescue StandardError
+    rescue StandardError => e
+      # `Config.load` raises a plain RuntimeError for "no file yet", so the
+      # file itself is what separates the two cases rather than the exception
+      # class.
+      warn "lowes: ignoring #{Lowes::Config.config_path} (#{e.message})" if Lowes::Config.config_path.exist?
       {}
     end
 
