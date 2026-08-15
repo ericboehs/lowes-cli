@@ -385,6 +385,19 @@ ORDER_DETAIL_EXTRACT_JS = r"""
 """
 
 
+# Lowe's keeps the actual line items behind an "Expand Items" toggle, so the
+# extractor above sees a collapsed list unless something opens it first.
+EXPAND_ITEMS_JS = r"""
+() => {
+  const targets = Array.from(document.querySelectorAll('button, a'))
+      .filter(e => /expand|show\s+(details|items)|view\s+items/i.test((e.textContent||'').trim()));
+  for (const t of targets) {
+    try { t.click(); } catch (e) {}
+  }
+}
+"""
+
+
 ORDERS_EXTRACT_JS = r"""
 () => {
   // Lowe's lists each order as <a href="...account/orders/details?oi=...">
@@ -566,6 +579,81 @@ PRICE_EXTRACT_JS = r"""
 
 # ---------- Action: sync_orders ----------
 
+def _pace(delay: float, jitter: float) -> None:
+    """Wait out the configured per-request delay. Every page load in the
+    order sync goes through here, retries included — a retry is another
+    request to Lowe's and does not get to skip the queue."""
+    if delay > 0:
+        time.sleep(max(0.0, delay + random.uniform(-jitter, jitter)))
+
+
+def _read_order_detail(page: Any, url: str, order_id: str | None) -> dict[str, Any]:
+    """One attempt at an order's detail page: load it, open whatever is
+    collapsed, read it. A function rather than inline code so the retry below
+    is a second call to the same steps instead of a second copy of them —
+    including the reload, which is the part that actually differs between a
+    page that rendered short and one that has nothing on it."""
+    page.goto(url, wait_until="domcontentloaded")
+    page.wait_for_timeout(2500)
+    try:
+        page.evaluate(EXPAND_ITEMS_JS)
+        page.wait_for_timeout(1500)
+    except Exception as e:  # noqa: BLE001
+        # Items sit behind this toggle. If it doesn't run the extractor still
+        # succeeds — on a collapsed list — and the order is stored short a
+        # dozen lines with nothing to say so. That is the same shape as the
+        # dedupe bug that hid 17 lines of an order, so it does not get to be
+        # silent.
+        emit("log", level="warn",
+             msg=f"could not expand items for {order_id} ({e}); "
+                 "the item list may be incomplete")
+    return page.evaluate(ORDER_DETAIL_EXTRACT_JS) or {}
+
+
+def order_detail(page: Any, url: str, order_id: str | None,
+                 delay: float = 0.0, jitter: float = 0.0) -> dict[str, Any]:
+    """An order's detail page, read twice if the first read finds no items.
+
+    An extraction that finds nothing is the one failure here that never
+    raises: the page loads, the extractor runs, and there is simply nothing
+    on it. Left alone that falls through with whatever the list page gave —
+    usually nothing — and the sync reports a clean run over an order it
+    stored empty.
+
+    Two different things produce it, and only one is worth a second look.
+    Lowe's serves a bare "Order Details" shell for some older orders, with no
+    line content at all (measured: the pre-rewrite extractor returns the same
+    empty result, so it is their page, not our selectors) — that one is empty
+    on every read and always will be. But detail pages also just render short
+    sometimes; order 33434280 came back with 11 items once and 34 on two
+    separate re-reads.
+
+    So: reload once. Cheap against the ~20 orders per full sync that land
+    here, it converts the transient case into real data, and what survives it
+    is the permanent case — which is the thing actually worth a warning.
+    """
+    detail = _read_order_detail(page, url, order_id)
+    if detail.get("items"):
+        return detail
+
+    _pace(delay, jitter)
+    retry = _read_order_detail(page, url, order_id)
+    if retry.get("items"):
+        emit("log", level="info",
+             msg=f"detail page for {order_id} came back empty; "
+                 f"a reload found {len(retry['items'])} line items")
+        return retry
+
+    emit("log", level="warn",
+         msg=f"no line items on the detail page for {order_id}, and none on a "
+             "reload; stored without them")
+    # Neither read found items, but a blank shell can still carry a status or
+    # a total. Prefer the first — there is no reason to think the later empty
+    # read knows those better — and fall to the second only when the first
+    # came back with literally nothing.
+    return detail or retry
+
+
 def sync_orders(context: Any, req: dict[str, Any]) -> int:
     page = context.new_page()
     years = [int(y) for y in (req.get("years") or [_today().year])]
@@ -664,59 +752,18 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
         # the live DOM. Lowe's HTML structure changes constantly, but
         # the JSON we capture here is the canonical local archive.
         if full_details and o.get("order_details_link"):
+            oid = o.get("order_id")
             try:
-                page.goto(o["order_details_link"], wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)
-
-                # Lowe's hides the actual order items behind an "Expand
-                # Items" toggle; click every "Expand" / "Show details"
-                # toggle we can find so the items are in the DOM.
-                try:
-                    page.evaluate(r"""() => {
-                        const targets = Array.from(document.querySelectorAll('button, a'))
-                            .filter(e => /expand|show\s+(details|items)|view\s+items/i.test((e.textContent||'').trim()));
-                        for (const t of targets) {
-                            try { t.click(); } catch (e) {}
-                        }
-                    }""")
-                    page.wait_for_timeout(1500)
-                except Exception as e:  # noqa: BLE001
-                    # Items sit behind this toggle. If it doesn't run the
-                    # extractor still succeeds — on a collapsed list — and the
-                    # order is stored short a dozen lines with nothing to say
-                    # so. That is the same shape as the dedupe bug that hid 17
-                    # lines of an order, so it does not get to be silent.
-                    emit("log", level="warn",
-                         msg=f"could not expand items for {o.get('order_id')} ({e}); "
-                             "the item list may be incomplete")
-
-                detail = page.evaluate(ORDER_DETAIL_EXTRACT_JS) or {}
+                detail = order_detail(page, o["order_details_link"], oid,
+                                      detail_delay, detail_jitter)
                 if detail.get("items"):
                     o["items"] = detail["items"]
-                else:
-                    # The one failure here that never raises: the page loads,
-                    # the extractor runs, and there is simply nothing on it.
-                    # Falling through leaves the order with whatever the list
-                    # page gave — usually nothing — and the sync reports a
-                    # clean run over an order it stored empty.
-                    #
-                    # Two different things land here. Lowe's serves a bare
-                    # "Order Details" shell for some older orders, with no
-                    # line content at all (measured: same empty result from
-                    # the pre-rewrite extractor, so it is their page, not our
-                    # selectors). And sometimes the detail page just hadn't
-                    # finished rendering — the same order re-read moments
-                    # later gives the full list. Only the second is worth
-                    # retrying, and telling them apart needs the message.
-                    emit("log", level="warn",
-                         msg=f"no line items on the detail page for {o.get('order_id')}; "
-                             "stored without them")
                 for k in ("status", "subtotal", "estimated_tax", "total_paid", "ship_to", "payment_method_last_4"):
                     if detail.get(k) is not None:
                         o[k] = detail[k]
             except Exception as e:  # noqa: BLE001
                 emit("log", level="warn",
-                     msg=f"detail fetch failed for {o.get('order_id')}: {e}")
+                     msg=f"detail fetch failed for {oid}: {e}")
 
         emit("progress", year=int(progress_year), i=i, n=len(new_orders),
              order_id=o.get("order_id"), date=o.get("order_placed"),
@@ -724,8 +771,7 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
              title=(o.get("items") or [{}])[0].get("title", "")[:60] if o.get("items") else "")
         emit("order", data=o)
         total_count += 1
-        if detail_delay > 0:
-            time.sleep(max(0.0, detail_delay + random.uniform(-detail_jitter, detail_jitter)))
+        _pace(detail_delay, detail_jitter)
 
     save_state(context)
     emit("done", count=total_count, skipped=0)
