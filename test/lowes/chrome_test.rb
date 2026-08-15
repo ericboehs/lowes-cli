@@ -12,18 +12,23 @@ class ChromeStartArgvTest < Minitest::Test
 
   PROFILE = "/tmp/lowes-test-profile".freeze
 
-  def command(headless)
+  def command(headless, binary = chrome_binary)
     cmd = Lowes::Commands::ChromeStart.new(quiet: true)
-    cmd.send(:command, chrome_binary, 9222, PROFILE, "https://www.lowes.com/", headless)
+    cmd.send(:command, binary, 9222, PROFILE, "https://www.lowes.com/", headless)
   end
 
   # Real if it is there, a stub that answers `--version` if it isn't, so this
   # asserts on the same code path on a laptop and in CI.
   def chrome_binary
     real = Lowes::Commands::ChromeStart::CHROME_APP
-    return real if File.exist?(real)
+    File.exist?(real) ? real : stub_binary
+  end
 
-    @stub ||= begin
+  # A binary whose version is known here, so the version assertion can name a
+  # literal instead of re-deriving it with the same `--version` call the
+  # implementation makes — which would pass no matter what that call returned.
+  def stub_binary
+    @stub_binary ||= begin
       path = File.join(@tmp, "chrome")
       File.write(path, "#!/bin/sh\necho 'Google Chrome 151.0.7922.109'\n")
       File.chmod(0o755, path)
@@ -46,9 +51,34 @@ class ChromeStartArgvTest < Minitest::Test
   end
 
   def test_user_agent_names_the_version_the_binary_reports
-    ua = command(true).find { |a| a.start_with?("--user-agent=") }
-    version = IO.popen([chrome_binary, "--version"], &:read)[/\d+/]
-    assert_includes ua, "Chrome/#{version}.0.0.0"
+    ua = command(true, stub_binary).find { |a| a.start_with?("--user-agent=") }
+    assert_includes ua, "Chrome/151.0.0.0"
+  end
+
+  # Everything above reaches past `run` into the private builder, which would
+  # keep passing if `run` stopped calling it or dropped the flag it parsed.
+  # This one goes through the front door and watches what gets spawned.
+  def test_run_spawns_the_argv_it_built
+    spawned = nil
+    with_spawn_stub(->(*argv, **_opts) { spawned = argv; 4242 }) do
+      status = Lowes::Commands::ChromeStart.new(quiet: true)
+                                           .run(["--headed", "--binary", stub_binary, "--profile", PROFILE])
+      assert_equal 0, status
+    end
+    assert_equal stub_binary, spawned.first
+    assert_includes spawned, "--user-data-dir=#{PROFILE}"
+    refute_includes spawned, "--headless"
+  end
+
+  def with_spawn_stub(stub)
+    original_spawn = Process.method(:spawn)
+    original_detach = Process.method(:detach)
+    Process.define_singleton_method(:spawn) { |*a, **k| stub.call(*a, **k) }
+    Process.define_singleton_method(:detach) { |_pid| nil }
+    yield
+  ensure
+    Process.define_singleton_method(:spawn, original_spawn)
+    Process.define_singleton_method(:detach, original_detach)
   end
 
   def test_configured_user_agent_wins
@@ -88,8 +118,25 @@ class ChromeHeadlessDefaultTest < Minitest::Test
     super
   end
 
+  # `write_default!` seeds `"headless": true`, so the shipped config is not the
+  # unconfigured case — remove the key to actually reach the nil branch.
   def test_defaults_to_headless_with_no_config_and_no_env
+    write_browser({})
     assert Lowes::Chrome.headless_default?
+  end
+
+  def test_defaults_to_headless_when_the_config_file_is_missing
+    File.delete(Lowes::Config.config_path)
+    assert Lowes::Chrome.headless_default?
+  end
+
+  # `!!"false"` is true, and `"headless": "false"` is an easy thing to write.
+  # Honouring it as headless would hand back a window to nobody.
+  def test_a_quoted_false_still_means_headed
+    %w[false 0 no off].each do |value|
+      write_browser("headless" => value)
+      refute Lowes::Chrome.headless_default?, %(headless: "#{value}" should mean headed)
+    end
   end
 
   def test_env_var_forces_a_window
@@ -134,11 +181,16 @@ class ChromeProcessDetectionTest < Minitest::Test
   HELPER = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper " \
            "--type=renderer --headless --user-data-dir=#{PROFILE}".freeze
 
+  # `module_function` puts `processes` on the singleton class, which is the same
+  # place `define_singleton_method` writes to — so this overwrites rather than
+  # shadows, and `remove_method` would delete the real one for the rest of the
+  # suite. Hold the original and put it back.
   def with_processes(lines)
+    original = Lowes::Chrome.method(:processes)
     Lowes::Chrome.define_singleton_method(:processes) { lines.map { |l| l + "\n" } }
     yield
   ensure
-    Lowes::Chrome.singleton_class.send(:remove_method, :processes)
+    Lowes::Chrome.define_singleton_method(:processes, original)
   end
 
   def test_finds_the_browser_process_not_its_helpers
@@ -170,5 +222,90 @@ class ChromeProcessDetectionTest < Minitest::Test
     with_processes([other]) do
       assert_nil Lowes::Chrome.running_argv(profile: PROFILE)
     end
+  end
+
+  # A `ps` that fails has to read as "we don't know", not "nothing is running":
+  # the latter sends `ensure_headed` off to kill a browser it never found.
+  def test_a_failed_ps_is_not_an_empty_process_list
+    original = Lowes::Chrome.method(:processes)
+    Lowes::Chrome.define_singleton_method(:processes) { nil }
+    assert_nil Lowes::Chrome.running_argv(profile: PROFILE)
+    assert_nil Lowes::Chrome.running_headless?(profile: PROFILE)
+  ensure
+    Lowes::Chrome.define_singleton_method(:processes, original)
+  end
+
+  def test_quit_ours_does_nothing_when_no_chrome_of_ours_is_running
+    with_processes([HELPER]) do
+      refute Lowes::Chrome.quit_ours(profile: PROFILE)
+    end
+  end
+
+  # Against the real `ps`, because the pid/command split is the only thing this
+  # method does and a stubbed `ps` would be asserting on my own formatting.
+  def test_pid_for_matches_a_command_line_to_its_pid
+    mine = IO.popen(["ps", "-axww", "-o", "pid=,command="], &:read)
+             .lines.find { |l| l.strip.split(" ", 2).first.to_i == Process.pid }
+    skip "no ps line for this process" unless mine
+    assert_equal Process.pid, Lowes::Chrome.pid_for(mine.strip.split(" ", 2).last)
+  end
+end
+
+# The three ways `lowes login` can find the port occupied. Getting this wrong
+# means asking someone to sign in to a window that isn't there — a ten-minute
+# silence ending in a timeout — or TERMing a browser that isn't ours.
+class ChromeEnsureHeadedTest < Minitest::Test
+  def with_chrome(stubs)
+    originals = stubs.keys.to_h { |name| [name, Lowes::Chrome.method(name)] }
+    stubs.each { |name, value| Lowes::Chrome.define_singleton_method(name) { |*, **| value } }
+    yield
+  ensure
+    originals.each { |name, method| Lowes::Chrome.define_singleton_method(name, method) }
+  end
+
+  def test_nothing_on_the_port_starts_a_headed_chrome
+    started = nil
+    with_chrome(cdp_reachable?: false) do
+      original = Lowes::Chrome.method(:ensure_started)
+      Lowes::Chrome.define_singleton_method(:ensure_started) { |quiet: false, headless: nil| started = headless; true }
+      assert Lowes::Chrome.ensure_headed(quiet: true)
+    ensure
+      Lowes::Chrome.define_singleton_method(:ensure_started, original)
+    end
+    assert_equal false, started, "login must ask for a window explicitly"
+  end
+
+  def test_a_headed_chrome_of_ours_is_left_alone
+    with_chrome(cdp_reachable?: true, running_headless?: false) do
+      assert Lowes::Chrome.ensure_headed(quiet: true)
+    end
+  end
+
+  # Somebody else's Chrome. Restarting it would take down whatever they were
+  # doing, so this reports success and lets the caller try the sign-in.
+  def test_a_chrome_that_is_not_ours_is_not_restarted
+    quit = false
+    with_chrome(cdp_reachable?: true, running_headless?: nil) do
+      original = Lowes::Chrome.method(:quit_ours)
+      Lowes::Chrome.define_singleton_method(:quit_ours) { |*, **| quit = true }
+      assert Lowes::Chrome.ensure_headed(quiet: true)
+    ensure
+      Lowes::Chrome.define_singleton_method(:quit_ours, original)
+    end
+    refute quit
+  end
+
+  def test_a_headless_chrome_of_ours_is_restarted_with_a_window
+    quit = false
+    started = nil
+    with_chrome(cdp_reachable?: true, running_headless?: true) do
+      originals = %i[quit_ours ensure_started].to_h { |n| [n, Lowes::Chrome.method(n)] }
+      Lowes::Chrome.define_singleton_method(:quit_ours) { |*, **| quit = true }
+      Lowes::Chrome.define_singleton_method(:ensure_started) { |quiet: false, headless: nil| started = headless; true }
+      assert Lowes::Chrome.ensure_headed(quiet: true)
+      originals.each { |n, m| Lowes::Chrome.define_singleton_method(n, m) }
+    end
+    assert quit, "the headless Chrome should have been asked to quit"
+    assert_equal false, started
   end
 end
