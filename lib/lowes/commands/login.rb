@@ -20,14 +20,19 @@ module Lowes
               Opens a real browser window so you can log in to Lowes.com manually
               (solving any captcha or 2FA). Cookies + storage state are saved so
               subsequent `lowes sync` calls reuse the session.
+
+              Always headed — if the shared Chrome is currently running headless
+              it is restarted with a window first.
             HELP
             return 0
           end
         end
 
         Lowes::Config.ensure_dirs!
-        unless Lowes::Chrome.ensure_started(quiet: @global[:quiet])
-          warn "login: Chrome (CDP) didn't come up — try `lowes chrome-start` manually"
+        # Headed, always: this is the one command where a person types into the
+        # window. Everything else runs headless.
+        unless Lowes::Chrome.ensure_headed(quiet: @global[:quiet])
+          warn "login: Chrome (CDP) didn't come up — try `lowes chrome-start --headed` manually"
           return 1
         end
         venv = File.join(PYWORKER, ".venv", "bin", "python")

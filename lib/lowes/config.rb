@@ -6,6 +6,7 @@ module Lowes
     DEFAULTS = {
       "default_year_window" => 2,
       "output" => { "color" => true },
+      "browser" => { "headless" => true },
       "rate_limit" => {
         "detail_delay" => 0.5,
         "detail_jitter" => 0.25,
@@ -27,6 +28,9 @@ module Lowes
     def color? = data.dig("output", "color") != false
     def rate_limit = data["rate_limit"] || {}
     def default_tax_rate = data["default_tax_rate"]
+    # How `lowes chrome-start` launches Chrome: headless (the default),
+    # binary, user_agent. See Lowes::Commands::ChromeStart.
+    def browser = data["browser"] || {}
 
     class << self
       def xdg_config_home
@@ -77,6 +81,7 @@ module Lowes
           "otp_op_ref" => nil,
           "default_year_window" => 2,
           "store_zip" => nil,
+          "browser" => { "headless" => true },
           "output" => { "color" => true }
         }) + "\n")
       end

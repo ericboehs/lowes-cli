@@ -157,9 +157,27 @@ module Lowes
 
     private
 
+    # The worker builds its own User-Agent for the no-CDP fallback path, from
+    # its own copy of the platform table. Handing it the values Ruby resolved
+    # is what keeps the two from drifting: `browser.user_agent` and
+    # `browser.binary` in config.json reach the worker only through here.
+    def worker_env
+      require_relative "chrome"
+      env = {}
+      binary = Lowes::Chrome.browser_config["binary"]
+      env["LOWES_CHROME_BINARY"] = binary if binary
+      env["LOWES_USER_AGENT"] = Lowes::Chrome.user_agent
+      env
+    rescue StandardError => e
+      # A UA we can't build is not worth failing a sync over — the worker has
+      # its own fallback, and this path only matters when CDP is unreachable.
+      warn "lowes: could not resolve a User-Agent for the worker (#{e.message})"
+      {}
+    end
+
     def run(request)
       cmd = python_cmd
-      Open3.popen3(*cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
+      Open3.popen3(worker_env, *cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
         stdin.write(JSON.generate(request) + "\n")
 
         err_thread = Thread.new do

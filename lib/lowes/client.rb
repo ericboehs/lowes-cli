@@ -14,10 +14,19 @@ module Lowes
     end
 
     BASE = "https://www.lowes.com/digitalpro/api/quote".freeze
-    DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36".freeze
+    # Only reached when the Chrome binary won't say what it is. The requests
+    # this client sends carry cookies harvested from that browser, so a UA
+    # naming a different Chrome is a contradiction Akamai is built to notice —
+    # hence `Lowes::Chrome.user_agent`, which asks the binary.
+    FALLBACK_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36".freeze
     CDP_URL = "http://127.0.0.1:9222".freeze
-    CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".freeze
-    CHROME_PROFILE = "#{Dir.home}/.local/share/lowes/cache/chrome-profile".freeze
+
+    def self.default_user_agent
+      require_relative "chrome"
+      Lowes::Chrome.user_agent
+    rescue StandardError
+      FALLBACK_USER_AGENT
+    end
 
     def self.from_storage_state(path = Lowes::Config.cache_dir.join("storage_state.json"), auto_refresh: true)
       raise Error, "no cookies at #{path} — run `lowes login` first" unless File.exist?(path)
@@ -64,20 +73,20 @@ module Lowes
       false
     end
 
+    # Delegates rather than spawning: this used to be a second copy of the
+    # launch flags, and a copy is where the headless User-Agent override gets
+    # forgotten. ChromeStart owns the argv; here we only say which page.
     def self.start_chrome!
-      return unless File.exist?(CHROME_APP)
-      FileUtils.mkdir_p(CHROME_PROFILE)
-      cmd = [
-        CHROME_APP,
-        "--remote-debugging-port=9222",
-        "--remote-allow-origins=*",
-        "--user-data-dir=#{CHROME_PROFILE}",
-        "--no-default-browser-check",
-        "--no-first-run",
-        "https://www.lowes.com/quotes"
-      ]
-      pid = Process.spawn(*cmd, [:out, :err] => "/dev/null")
-      Process.detach(pid)
+      require_relative "chrome"
+      require_relative "commands/chrome_start"
+      # No File.exist? check here: ChromeStart resolves --binary and
+      # browser.binary before falling back to CHROME_APP, so testing that
+      # constant would silently return nil for anyone on Linux or with a
+      # configured binary, and the caller would then blame the 15s timeout.
+      Lowes::Commands::ChromeStart.new(silent: true).run(
+        ["--url", "https://www.lowes.com/quotes",
+         Lowes::Chrome.headless_default? ? "--headless" : "--headed"]
+      )
     end
 
     def self.ensure_lowes_tab!(cdp_url: CDP_URL)
@@ -140,7 +149,8 @@ module Lowes
       sock.read(length)
     end
 
-    def initialize(cookies:, user_agent: DEFAULT_USER_AGENT, storage_state_path: nil, auto_refresh: false)
+    def initialize(cookies:, user_agent: nil, storage_state_path: nil, auto_refresh: false)
+      user_agent ||= self.class.default_user_agent
       @cookie_header = build_cookie_header(cookies)
       @user_agent = user_agent
       @storage_state_path = storage_state_path

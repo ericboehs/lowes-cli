@@ -32,6 +32,8 @@ fetched_at           model     title                              price    statu
 
 - **Real-browser login** — Playwright opens Chrome, you finish password +
   2FA + any captcha. Storage state persists; subsequent syncs are silent.
+- **Headless by default** — everything but `lowes login` runs without a
+  window, so a sync doesn't steal focus mid-sentence.
 - **Orders** — pull order history per year into a local JSON store. Skips
   orders already on disk; `--full` re-fetches everything.
 - **Quotes** — pull saved Lowe's quotes the same way.
@@ -58,7 +60,9 @@ lib/lowes/
   store.rb              orders / quotes / materials / price history
   worker.rb             spawns Python worker, parses NDJSON over stdout
   formatter.rb          tables, --json, color
+  chrome.rb             headless/headed policy, CDP reachability, UA string
 pyworker/
+  stealth.py            attaches to that Chrome over CDP; the one seam
   fetch.py              one-shot worker; drives Playwright; emits NDJSON
   login.py              Playwright headed login; persists storage state
   pyproject.toml        deps: playwright
@@ -110,9 +114,17 @@ lowes config edit
   "otp_op_ref":       null,
   "default_year_window": 5,
   "store_zip":        null,
+  "browser":          { "headless": true },
   "output": { "color": true }
 }
 ```
+
+`browser` also takes `binary` (path to Chrome) and `user_agent` (override the
+string built from the binary's version — needed on a platform other than
+macOS or Linux). Both are passed through to the Python worker as
+`LOWES_CHROME_BINARY` / `LOWES_USER_AGENT`, so its fallback launcher names the
+same browser the CLI does. Whatever you set, it must not contain
+`HeadlessChrome`; that is the one token Akamai refuses outright.
 
 The `op://` references use the [1Password CLI](https://developer.1password.com/docs/cli/);
 swap in your own password manager or just hardcode a value if you must.
@@ -124,21 +136,53 @@ Lowe's actively blocks vanilla automated browsers ("We're unable to sign you
 in right now"). The reliable workaround is to attach to your real Chrome.app
 over Chrome DevTools Protocol — `lowes chrome-start` launches Chrome with
 remote-debugging enabled, you sign in once like a human, and every other
-`lowes` command auto-detects the running Chrome and reuses it.
+`lowes` command auto-detects the running Chrome and reuses it. Started this
+way, directly rather than through Playwright's launcher, Chrome was never in
+automation mode, which is the whole reason the attach design exists.
 
 ```bash
-# 1) Launch a dedicated Chrome window with debugging on
-lowes chrome-start
-#    Sign in to Lowe's in this window once. Cookies persist in
-#    ~/.local/share/lowes/cache/chrome-profile so this is a one-time step.
+# 1) Sign in once. This one needs a window — you're typing in it.
+lowes login
+#    Cookies persist in ~/.local/share/lowes/cache/chrome-profile,
+#    so this is a one-time step.
 
 # 2) From any other terminal, run lowes commands as normal
 lowes sync
 lowes price 1001234
 ```
 
-If you don't run `chrome-start`, lowes falls back to a plain automated
-Chromium — fine for opening pages but Lowe's may refuse the login.
+Everything but `lowes login` runs **headless** — commands start Chrome on
+demand and no window appears. Put the window back with any of:
+
+```bash
+lowes chrome-start --headed     # this launch
+LOWES_HEADLESS=0 lowes sync     # this invocation
+# or "browser": { "headless": false } in config.json, permanently
+```
+
+These decide how Chrome is *launched*, so they only bite when there is no
+Chrome on port 9222 yet. A command that finds one already running attaches to
+it as-is; to swap a headless Chrome for a windowed one, quit it first (or run
+`lowes login`, which does that for you).
+
+Headless costs one extra flag and it is not optional: Chrome names itself
+`HeadlessChrome/<version>` in its own User-Agent, and Akamai answers **403
+Access Denied** on that token before a byte of the page arrives — no `_abck`
+cookie is ever issued, so no amount of fingerprint patching downstream can
+help. `chrome-start` pairs `--headless` with a `--user-agent` built from the
+version the binary reports about itself, and with it a cold profile gets the
+real homepage and a validated `_abck` in about three seconds. The string is
+built rather than hardcoded on purpose — a UA naming a Chrome older than the
+engine behind it is a worse tell than `HeadlessChrome` was.
+
+`lowes login` is always headed, and restarts a headless Chrome with a window
+first if it finds one, because signing in to a browser you cannot see is a
+ten-minute wait ending in a timeout.
+
+If no Chrome is reachable and none can be started, commands stop with the
+error rather than falling back — the Python worker can launch its own
+persistent Chromium context (`pyworker/stealth.py`), but nothing in the CLI
+reaches that path, and Lowe's tends to refuse a login through it anyway.
 
 ```bash
 lowes login                    # one-time browser-based login (handles captcha + 2FA)

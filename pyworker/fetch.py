@@ -167,8 +167,42 @@ def scripted_login(page: Any, email: str, password: str, otp_secret: str | None)
 
 # ---------- Extractors (run in browser) ----------
 
+# Split out of the extractor below because it decides money and touches no
+# DOM, so it can be driven straight from a string in a test. Kept as its own
+# constant rather than buried in the big template for the same reason: the
+# test slices this exact block out of this file.
+# See test/pyworker/order_extract_test.rb.
+LINE_PRICES_JS = r"""
+// Standalone $ amounts in a row: line totals and strikethroughs, but not
+// per-unit "/ea" prices and not savings figures.
+function pickLinePrices(text) {
+  // "Saved $19.84 with Volume Savings Discount" and "Member Discount: Save
+  // $3.88" are not prices anything sold for. They matter because line_was
+  // takes the smallest amount above line_total: once the savings exceed
+  // what was paid, the savings figure outranks the real strikethrough. The
+  // trailing [-(]? catches "Savings -$12.34" and "Savings ($5.00)", either
+  // of which would otherwise walk straight back into the bug.
+  const savingsLabel = /sav(?:ings?|ed|e)\b[\s:]*[-(]?\s*$/i;
+  // The lookaheads keep the amount from backtracking to a shorter number in
+  // order to satisfy the /ea guard: without them "$5.00 /ea" matches as "5"
+  // and a per-unit price lands in the line-total pool. They have to be this
+  // specific — a blanket (?![0-9.]) also drops "$37.96." at the end of a
+  // sentence and truncates "$1,234.56" to "1".
+  const re = /\$\s*([0-9,]+(?:\.\d{2})?)(?!\d)(?!\.\d)(?!,)(?!\s*\/\s*ea)/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (savingsLabel.test(text.slice(Math.max(0, m.index - 24), m.index))) continue;
+    const v = parseFloat(m[1].replace(/,/g, ''));
+    if (!isNaN(v)) out.push(v);
+  }
+  return out;
+}
+"""
+
 ORDER_DETAIL_EXTRACT_JS = r"""
 () => {
+""" + LINE_PRICES_JS + r"""
   // Each item on a Lowe's order detail page is anchored by an <a> to /pd/.
   // Walk up to the smallest container that holds qty/price/image and
   // extract from there.
@@ -196,11 +230,15 @@ ORDER_DETAIL_EXTRACT_JS = r"""
 
   const anchors = Array.from(document.querySelectorAll('a[href*="/pd/"]'))
     .filter(a => !isRecAnchor(a));
+  // Dedupe by row element, not by href. A row holds two anchors for the same
+  // product (image column and title column) and those must collapse — but an
+  // order that bought the same item twice gets two separate rows with the
+  // same href, and those are two real lines. Keying on href dropped the
+  // second one and made the order read as cheaper than it was.
   const seen = new Set();
   const items = [];
   for (const a of anchors) {
     const href = a.href;
-    if (seen.has(href)) continue;
 
     let row = null, el = a, hops = 0, foundQty = false;
     while (el && el.parentElement && hops < 14) {
@@ -226,7 +264,13 @@ ORDER_DETAIL_EXTRACT_JS = r"""
       }
     }
     if (!row) continue;
-    seen.add(href);
+    // Containment, not identity: two anchors in one row normally resolve to
+    // the same element, but if an info column carries its own <img> the
+    // walk can stop at different ancestors and the row would be counted
+    // twice — the inverse of the bug above, which href-dedupe used to hide.
+    // Separate cart lines are siblings, so neither contains the other.
+    if ([...seen].some(r => r.contains(row) || row.contains(r))) continue;
+    seen.add(row);
 
     const text = row ? (row.innerText || '') : '';
     const titleEl = a.querySelector('img[alt]');
@@ -248,14 +292,7 @@ ORDER_DETAIL_EXTRACT_JS = r"""
     const eaPrices = (text.match(/\$\s*[0-9,]+(?:\.\d{2})?\s*\/\s*ea/gi) || [])
       .map(s => parseFloat(s.replace(/[^0-9.]/g, '')))
       .filter(n => !isNaN(n));
-    const linePrices = [];
-    {
-      const re = /\$\s*([0-9,]+(?:\.\d{2})?)(?!\s*\/\s*ea)/gi;
-      let m; while ((m = re.exec(text)) !== null) {
-        const v = parseFloat(m[1].replace(/,/g, ''));
-        if (!isNaN(v)) linePrices.push(v);
-      }
-    }
+    const linePrices = pickLinePrices(text);
 
     const qm = text.match(/\bQTY\s+(\d+)/i);
     const qty = qm ? parseInt(qm[1], 10) : null;

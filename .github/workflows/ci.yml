@@ -32,7 +32,10 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Pinned because unpinned is how this job broke: 0.16 widened the default
+      # rule set and 18 findings that had always been there became errors
+      # overnight. Temporary — the follow-up PR fixes those and unpins.
+      - run: pip install ruff==0.15.12
       - run: ruff check .
       - run: python -m compileall -q .
 
