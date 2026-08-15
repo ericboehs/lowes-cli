@@ -71,7 +71,11 @@ AUTH_COOKIE_NAMES = {"lowesauthcookie", "__Host-lsid", "L_SID", "al_sess"}
 
 def main() -> int:
     try:
-        from stealth import sync_playwright_module, open_stealth_context, cdp_endpoint  # type: ignore[import-not-found]
+        from stealth import (  # type: ignore[import-not-found]
+            cdp_endpoint,
+            open_stealth_context,
+            sync_playwright_module,
+        )
     except ImportError as e:
         emit("error", msg=f"stealth helper missing: {e}")
         return 2
@@ -145,6 +149,7 @@ def main() -> int:
 
         deadline = time.time() + 600
         authenticated = False
+        poll_warned = False
         while time.time() < deadline:
             try:
                 cookies = context.cookies()
@@ -154,8 +159,14 @@ def main() -> int:
                     if "/login" not in url and "/signin" not in url:
                         authenticated = True
                         break
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                # Transient while the page navigates, so this keeps polling —
+                # but if it is not transient the alternative is ten minutes of
+                # silence ending in "timed out waiting for sign-in", with the
+                # actual reason never mentioned. Reported once.
+                if not poll_warned:
+                    poll_warned = True
+                    emit("log", level="warn", msg=f"could not read cookies while waiting: {e}")
             time.sleep(2)
 
         if not authenticated:

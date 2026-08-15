@@ -30,6 +30,7 @@ selector degrades gracefully (returns null fields) instead of crashing.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
@@ -43,6 +44,17 @@ from typing import Any
 
 # Make sibling modules (stealth.py) importable when run directly.
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+def _today() -> date:
+    """Today in the machine's local timezone.
+
+    Spelled out rather than `date.today()` so the timezone is a decision
+    instead of a default. Local is the right one here: it bounds the
+    order-history date ranges Lowe's is asked for, and Lowe's dates orders in
+    store-local time. UTC would ask for tomorrow for eight hours a day.
+    """
+    return datetime.now(timezone.utc).astimezone().date()
 
 
 # ---------- URLs / selectors (tune these as the site shifts) ----------
@@ -157,8 +169,11 @@ def scripted_login(page: Any, email: str, password: str, otp_secret: str | None)
                 code = sys.stdin.readline().strip()
                 otp_input.first.fill(code)
                 page.locator("button[type=submit]").first.click()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Worth saying: the user has just typed a code and this is the
+            # only place it goes. Swallowed, the loop keeps spinning and they
+            # are told they aren't signed in, with no hint the code was fine.
+            emit("log", level="warn", msg=f"could not submit the verification code: {e}")
         time.sleep(1.5)
 
     url = page.url or ""
@@ -549,16 +564,15 @@ PRICE_EXTRACT_JS = r"""
 
 def sync_orders(context: Any, req: dict[str, Any]) -> int:
     page = context.new_page()
-    years = [int(y) for y in (req.get("years") or [date.today().year])]
+    years = [int(y) for y in (req.get("years") or [_today().year])]
     known = set(req.get("known_order_ids") or [])
     full_details = bool(req.get("full_details", True))
     detail_delay = float(req.get("detail_delay", 0.5))
     detail_jitter = float(req.get("detail_jitter", 0.25))
 
-    if not is_authenticated(context, page):
-        if not _ensure_login(page, req):
-            emit("error", msg="not authenticated; run `lowes login`")
-            return 1
+    if not is_authenticated(context, page) and not _ensure_login(page, req):
+        emit("error", msg="not authenticated; run `lowes login`")
+        return 1
 
     total_count = 0
     # Lowe's `/account/orders` caps each view at 50 orders, even when
@@ -569,7 +583,7 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
     year_set = sorted({int(y) for y in years}, reverse=True)
     seen_ids: set[str] = set()
     orders: list[dict[str, Any]] = []
-    today = date.today()
+    today = _today()
     quarters = [(1, 1, 3, 31), (4, 1, 6, 30), (7, 1, 9, 30), (10, 1, 12, 31)]
     for y in year_set:
         for sm, sd, em, ed in quarters:
@@ -577,8 +591,7 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
             end = date(y, em, ed)
             if start > today:
                 continue
-            if end > today:
-                end = today
+            end = min(end, today)
             url = (f"https://www.lowes.com/account/orders?isOrg=false"
                    f"&startDate={start.isoformat()}&endDate={end.isoformat()}")
             emit("log", level="info", msg=f"fetching {url}")
@@ -592,8 +605,13 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
             try:
                 page.wait_for_selector('a[href*="account/orders/details"]', timeout=8000)
                 page.wait_for_timeout(800)
-            except Exception:  # noqa: BLE001
-                # Empty quarter is normal — Lowe's renders an empty list.
+            except Exception as e:  # noqa: BLE001
+                # Usually an empty quarter, which is normal — Lowe's renders
+                # an empty list and the selector never appears. But a changed
+                # selector looks identical from here, and that silently syncs
+                # zero orders, so the reason goes on the record either way.
+                emit("log", level="info",
+                     msg=f"no order links for {start}..{end} (empty quarter, or the selector moved): {e}")
                 continue
 
             _scroll_to_bottom(page)
@@ -646,8 +664,15 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
                         }
                     }""")
                     page.wait_for_timeout(1500)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    # Items sit behind this toggle. If it doesn't run the
+                    # extractor still succeeds — on a collapsed list — and the
+                    # order is stored short a dozen lines with nothing to say
+                    # so. That is the same shape as the dedupe bug that hid 17
+                    # lines of an order, so it does not get to be silent.
+                    emit("log", level="warn",
+                         msg=f"could not expand items for {o.get('order_id')} ({e}); "
+                             "the item list may be incomplete")
 
                 detail = page.evaluate(ORDER_DETAIL_EXTRACT_JS) or {}
                 if detail.get("items"):
@@ -677,10 +702,9 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
 
 def sync_quotes(context: Any, req: dict[str, Any]) -> int:
     page = context.new_page()
-    if not is_authenticated(context, page):
-        if not _ensure_login(page, req):
-            emit("error", msg="not authenticated; run `lowes login`")
-            return 1
+    if not is_authenticated(context, page) and not _ensure_login(page, req):
+        emit("error", msg="not authenticated; run `lowes login`")
+        return 1
 
     emit("log", level="info", msg=f"fetching {QUOTES_URL}")
     page.goto(QUOTES_URL, wait_until="domcontentloaded")
@@ -739,8 +763,11 @@ def fetch_prices(context: Any, req: dict[str, Any]) -> int:
             )
             # Extra settle for the price spans, which lazy-load after the h1
             page.wait_for_timeout(800)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Only a settle; the extract below runs regardless and warns for
+            # itself if it comes back empty. Logged at info because a run
+            # where every item hits this is worth being able to see.
+            emit("log", level="info", msg=f"price selectors never settled for {url}: {e}")
 
         try:
             data = page.evaluate(PRICE_EXTRACT_JS) or {}
@@ -810,8 +837,12 @@ def _read_store_cookies(context: Any) -> dict[str, str]:
         for c in context.cookies():
             if c.get("name") in STORE_COOKIE_NAMES:
                 out[c["name"]] = c.get("value", "")
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # An empty dict here is indistinguishable from "no store cookies set",
+        # and the caller diffs before against after to decide whether the
+        # store actually changed — so a failure at either end reports a
+        # confident wrong answer.
+        emit("log", level="warn", msg=f"could not read store cookies: {e}")
     return out
 
 
@@ -859,8 +890,11 @@ def set_store(context: Any, req: dict[str, Any]) -> int:
         try:
             page.goto(STORE_FINDER_URL.format(zip=zip_code), wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e2:  # noqa: BLE001
+            # Both routes to the store finder are now gone. The click below
+            # will fail and say so, but it will blame the button rather than
+            # the page never having loaded.
+            emit("log", level="warn", msg=f"query-string fallback also failed: {e2}")
 
     try:
         btn = page.locator(SET_STORE_BUTTON_SELECTORS).first
@@ -881,7 +915,9 @@ def set_store(context: Any, req: dict[str, Any]) -> int:
             }""", btn.element_handle())
             if label:
                 emit("log", level="info", msg=f"clicking: {label}")
-        except Exception:  # noqa: BLE001
+        # Genuinely cosmetic: this whole block exists to name the store in a
+        # log line. The click below is what matters and reports for itself.
+        except Exception:  # noqa: BLE001, S110
             pass
         btn.click()
         page.wait_for_timeout(1500)
@@ -896,8 +932,13 @@ def set_store(context: Any, req: dict[str, Any]) -> int:
     try:
         page.goto("https://www.lowes.com/", wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Without this navigation most of the cookies never refresh, so the
+        # diff below finds nothing changed and tells the user the store didn't
+        # take — when in fact the click worked and only the hydration didn't.
+        emit("log", level="warn",
+             msg=f"could not reload the homepage to hydrate store cookies ({e}); "
+                 "the report below may understate what changed")
 
     after = _read_store_cookies(context)
     changed = {k: (before.get(k), after.get(k)) for k in STORE_COOKIE_NAMES if before.get(k) != after.get(k)}
@@ -925,8 +966,12 @@ def _scroll_to_bottom(page: Any, max_steps: int = 25, settle_ms: int = 400) -> N
             page.evaluate(f"() => window.scrollTo(0, {h})")
             page.wait_for_timeout(settle_ms)
             last = h
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Everything below the fold is lazy-loaded, so a failure here means the
+        # extractors run against a short page and report a confident partial
+        # answer — fewer orders, fewer quotes, no error anywhere.
+        emit("log", level="warn",
+             msg=f"scrolling stopped early ({e}); the page may not be fully loaded")
 
 
 def _ensure_login(page: Any, req: dict[str, Any]) -> bool:
@@ -979,10 +1024,10 @@ def main() -> int:
                 # If attached over CDP, leave the user's Chrome window open.
                 from stealth import cdp_endpoint  # type: ignore[import-not-found]
                 if not cdp_endpoint():
-                    try:
+                    # Teardown in a finally, on the way out of the process.
+                    # There is no one left to tell and nothing left to do.
+                    with contextlib.suppress(Exception):
                         context.close()
-                    except Exception:  # noqa: BLE001
-                        pass
     except Exception as e:  # noqa: BLE001
         emit("error", msg=f"{type(e).__name__}: {e}", trace=traceback.format_exc())
         return 1
