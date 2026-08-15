@@ -206,7 +206,17 @@ lowes sync --full              # re-fetch everything
 lowes list --year 2025 --limit 25
 lowes show WB12345678
 lowes search "treated lumber"
+```
 
+A re-sync can add line items to an order and correct the ones it has, but it
+cannot take any away. Lowe's order-detail pages sometimes render short — or,
+for some older orders, render no line content at all — and the scraper has no
+way to tell that from an order that genuinely had fewer items. Since a placed
+order does not lose line items after the fact, the longer list wins and the
+sync says which orders it protected. If one really did change, delete
+`~/.local/share/lowes/orders/<year>/<id>.json` and sync again.
+
+```bash
 # Quotes
 lowes quotes sync
 lowes quotes list

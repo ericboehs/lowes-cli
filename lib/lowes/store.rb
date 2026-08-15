@@ -22,7 +22,12 @@ module Lowes
 
     # ----- Orders -----
 
-    def write_order(order)
+    # `detailed:` is whether the caller actually asked for per-order detail.
+    # `lowes sync --no-full-details` never opens an order page, so every order
+    # arrives with no line items by design — that record is not evidence about
+    # items one way or the other, and treating it as a loss would warn once per
+    # order for doing exactly what was asked.
+    def write_order(order, detailed: true)
       id = order["order_id"]
       raise "order missing order_id" unless id
 
@@ -30,6 +35,7 @@ module Lowes
       year_dir = @orders_dir.join(year.to_s)
       FileUtils.mkdir_p(year_dir)
       file = year_dir.join("#{id}.json")
+      order = keep_line_items(order, file, announce: detailed)
       File.write(file, JSON.pretty_generate(order) + "\n")
 
       relative = file.relative_path_from(Config.data_dir).to_s
@@ -136,6 +142,41 @@ module Lowes
     end
 
     private
+
+    # An order that has been placed does not get fewer line items later, so a
+    # re-sync that comes back with fewer is this tool losing them, not Lowe's
+    # changing its mind. Measured, not assumed: re-scraping 2023 against the
+    # live site dropped 27 line items across 7 orders — five to zero, one from
+    # 33 to 11 — while the same pages re-read moments later gave the full
+    # lists back. Nothing said a word, because this method replaces the file
+    # wholesale and the worker only reports what it did find.
+    #
+    # So the longer list wins, and the difference gets announced. That does
+    # mean a genuinely corrected order cannot shrink; deleting its file and
+    # syncing again is the way out, and the warning says so.
+    def keep_line_items(order, file, announce:)
+      return order unless file.exist?
+
+      incoming = order["items"] || []
+      stored = stored_items(file)
+      return order if stored.length <= incoming.length
+
+      if announce
+        warn "lowes: order #{order["order_id"]} came back with #{incoming.length} line " \
+             "item#{"s" unless incoming.length == 1} but #{stored.length} are already stored " \
+             "— keeping the stored ones. Delete #{file} and re-sync if the order really changed."
+      end
+      order.merge("items" => stored)
+    end
+
+    # A file we cannot read has nothing to protect. Silent on purpose: the
+    # caller is about to overwrite it either way, and the only thing this
+    # answers is whether there is something in there worth keeping.
+    def stored_items(file)
+      JSON.parse(File.read(file))["items"] || []
+    rescue StandardError
+      []
+    end
 
     def year_for(record, date_key)
       placed = record[date_key]
