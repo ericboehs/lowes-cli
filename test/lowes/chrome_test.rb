@@ -1,5 +1,6 @@
 require_relative "../test_helper"
 require "json"
+require "socket"
 require "lowes/chrome"
 require "lowes/commands/chrome_start"
 
@@ -307,5 +308,155 @@ class ChromeEnsureHeadedTest < Minitest::Test
     end
     assert quit, "the headless Chrome should have been asked to quit"
     assert_equal false, started
+  end
+end
+
+# `/json/version` is the browser describing itself, and the one field worth the
+# read is the User-Agent: `HeadlessChrome` there is a 403 from Akamai a few
+# seconds later, blamed on the session. Served over a real socket rather than a
+# stubbed `Net::HTTP`, because the two ways this comes back wrong — a body that
+# isn't JSON, a port that isn't answering — both live below that seam.
+class ChromeCdpVersionTest < Minitest::Test
+  HEADLESS = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
+             "(KHTML, like Gecko) HeadlessChrome/151.0.0.0 Safari/537.36".freeze
+  REAL = HEADLESS.sub("HeadlessChrome", "Chrome").freeze
+
+  def body(user_agent) = JSON.generate("Browser" => "Chrome/151.0.7922.109", "User-Agent" => user_agent)
+
+  # One request, one response, then gone — which is all `cdp_version` makes.
+  def with_cdp(body, status: "200 OK")
+    server = TCPServer.new("127.0.0.1", 0)
+    thread = Thread.new do
+      socket = server.accept
+      while (line = socket.gets) && line.strip != ""; end
+      socket.write("HTTP/1.1 #{status}\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
+      socket.close
+    end
+    yield "http://127.0.0.1:#{server.addr[1]}"
+  ensure
+    thread&.kill
+    server&.close
+  end
+
+  def test_reads_the_user_agent_out_of_the_body
+    with_cdp(body(HEADLESS)) do |url|
+      assert_equal HEADLESS, Lowes::Chrome.cdp_version(url: url)["User-Agent"]
+    end
+  end
+
+  # `webSocketDebuggerUrl` is read out of this same body before anything can
+  # attach, so a body we can't parse is a port we can't use. Calling it
+  # reachable only moves the failure somewhere it explains itself worse.
+  def test_a_body_that_is_not_json_is_not_a_usable_port
+    with_cdp("<html>not chrome</html>") do |url|
+      assert_nil Lowes::Chrome.cdp_version(url: url)
+    end
+  end
+
+  def test_a_non_success_status_is_not_a_usable_port
+    with_cdp(body(REAL), status: "404 Not Found") do |url|
+      assert_nil Lowes::Chrome.cdp_version(url: url)
+    end
+  end
+
+  def test_nothing_listening_is_nil_rather_than_an_exception
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    server.close
+    assert_nil Lowes::Chrome.cdp_version(timeout: 0.5, url: "http://127.0.0.1:#{port}")
+  end
+end
+
+# The token, and what gets said about it. Only the positive direction is an
+# answer: a headless Chrome started the way this tool starts one is overriding
+# that string on purpose, so its absence means "no idea", not "has a window".
+class ChromeHeadlessUaTest < Minitest::Test
+  def with_ua(user_agent)
+    original = Lowes::Chrome.method(:cdp_user_agent)
+    Lowes::Chrome.define_singleton_method(:cdp_user_agent) { |*, **| user_agent }
+    yield
+  ensure
+    Lowes::Chrome.define_singleton_method(:cdp_user_agent, original)
+  end
+
+  def test_detects_a_chrome_that_names_itself_headless
+    with_ua(ChromeCdpVersionTest::HEADLESS) { assert Lowes::Chrome.headless_ua? }
+  end
+
+  # The state every command is meant to be in. Flagging this would fire the
+  # warning on every successful run, which is how a real warning stops being read.
+  def test_a_headless_chrome_with_the_override_is_not_flagged
+    with_ua(ChromeCdpVersionTest::REAL) { refute Lowes::Chrome.headless_ua? }
+  end
+
+  def test_no_browser_at_all_is_not_flagged
+    with_ua(nil) { refute Lowes::Chrome.headless_ua? }
+  end
+
+  def test_the_warning_names_the_token_it_found
+    out, err = with_ua(ChromeCdpVersionTest::HEADLESS) { capture_io { Lowes::Chrome.warn_headless_ua } }
+    assert_empty out
+    assert_includes err, "HeadlessChrome/151.0.0.0"
+    assert_includes err, "403"
+  end
+
+  def test_nothing_is_said_about_a_browser_that_will_be_accepted
+    _, err = with_ua(ChromeCdpVersionTest::REAL) { capture_io { Lowes::Chrome.warn_headless_ua } }
+    assert_empty err
+  end
+
+  # Someone else's Chrome, which we won't restart either way — but "sign in
+  # there" is advice you cannot take when there is no window, and following it
+  # is the ten-minute timeout `ensure_headed` exists to prevent.
+  def test_a_foreign_headless_chrome_is_not_offered_as_somewhere_to_sign_in
+    with_ua(ChromeCdpVersionTest::HEADLESS) do
+      assert_includes Lowes::Chrome.foreign_chrome_warning, "no window to sign in to"
+    end
+  end
+
+  def test_a_foreign_chrome_that_may_have_a_window_is_offered_as_one
+    with_ua(ChromeCdpVersionTest::REAL) do
+      assert_includes Lowes::Chrome.foreign_chrome_warning, "sign in there if it has a window"
+    end
+  end
+end
+
+# The wiring. Both paths through `ensure_started` end with a browser on the
+# port, and either one can end with the wrong browser on the port.
+class ChromeEnsureStartedWarnsTest < Minitest::Test
+  def with_chrome(stubs)
+    originals = stubs.keys.to_h { |name| [name, Lowes::Chrome.method(name)] }
+    stubs.each { |name, value| Lowes::Chrome.define_singleton_method(name) { |*, **| value } }
+    yield
+  ensure
+    originals.each { |name, method| Lowes::Chrome.define_singleton_method(name, method) }
+  end
+
+  def test_warns_about_a_headless_chrome_that_was_already_running
+    _, err = with_chrome(cdp_reachable?: true, cdp_user_agent: ChromeCdpVersionTest::HEADLESS) do
+      capture_io { assert Lowes::Chrome.ensure_started }
+    end
+    assert_includes err, "HeadlessChrome"
+  end
+
+  # Passing `--user-agent` and the browser having taken it are separate claims.
+  # This asserts the second one gets checked, on the browser we just launched.
+  def test_warns_about_a_headless_chrome_it_launched_itself
+    _, err = with_chrome(cdp_reachable?: false, wait_for_cdp: true,
+                         cdp_user_agent: ChromeCdpVersionTest::HEADLESS) do
+      original = Lowes::Commands::ChromeStart.instance_method(:run)
+      Lowes::Commands::ChromeStart.define_method(:run) { |*| 0 }
+      capture_io { assert Lowes::Chrome.ensure_started }
+    ensure
+      Lowes::Commands::ChromeStart.define_method(:run, original)
+    end
+    assert_includes err, "HeadlessChrome"
+  end
+
+  def test_quiet_stays_quiet
+    _, err = with_chrome(cdp_reachable?: true, cdp_user_agent: ChromeCdpVersionTest::HEADLESS) do
+      capture_io { Lowes::Chrome.ensure_started(quiet: true) }
+    end
+    assert_empty err
   end
 end
