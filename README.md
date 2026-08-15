@@ -208,12 +208,20 @@ lowes show WB12345678
 lowes search "treated lumber"
 ```
 
-A re-sync can add line items to an order and correct the ones it has, but it
-cannot take any away. Lowe's order-detail pages sometimes render short — or,
-for some older orders, render no line content at all — and the scraper has no
-way to tell that from an order that genuinely had fewer items. Since a placed
-order does not lose line items after the fact, the longer list wins and the
-sync says which orders it protected. If one really did change, delete
+Lowe's order-detail pages sometimes render short, and for some older orders
+they render no line content at all — a bare "Order Details" shell. The scraper
+can't tell either from an order that genuinely had fewer items, so `sync`
+handles it from both ends:
+
+- **It looks twice.** A detail page that comes back with no line items gets
+  reloaded once; most recover on the second read, and only the ones that stay
+  empty are reported. That distinction is the whole point — a page that is
+  empty every time is Lowe's, not a bad sync.
+- **It won't shrink an order.** A placed order does not lose line items after
+  the fact, so the longer list wins and the sync names the orders it
+  protected. Items still get corrected in place; only removal is refused.
+
+If an order really did change, delete
 `~/.local/share/lowes/orders/<year>/<id>.json` and sync again.
 
 ```bash
