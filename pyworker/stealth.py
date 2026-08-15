@@ -103,7 +103,7 @@ def installed_version(binary: str | None = None) -> str:
         return FALLBACK_VERSION
     try:
         out = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=10
+            [binary, "--version"], capture_output=True, text=True, timeout=10, check=False
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return FALLBACK_VERSION
@@ -152,14 +152,14 @@ def open_stealth_context(
     args = ["--disable-blink-features=AutomationControlled"]
     if not headed:
         args.append(f"--user-agent={user_agent()}")
-    options: dict[str, Any] = dict(
-        user_data_dir=str(user_data_dir),
-        headless=not headed,
-        viewport=viewport or {"width": 1366, "height": 900},
-        locale=locale,
-        timezone_id=timezone_id,
-        args=args,
-    )
+    options: dict[str, Any] = {
+        "user_data_dir": str(user_data_dir),
+        "headless": not headed,
+        "viewport": viewport or {"width": 1366, "height": 900},
+        "locale": locale,
+        "timezone_id": timezone_id,
+        "args": args,
+    }
     # The real binary, not Playwright's bundled "Chrome for Testing" — a
     # different build than the one measured to pass, and testing the wrong
     # binary answers the wrong question.
