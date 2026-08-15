@@ -1,5 +1,6 @@
 require "fileutils"
 require "open3"
+require "json"
 require "net/http"
 
 require_relative "config"
@@ -77,13 +78,60 @@ module Lowes
 
     def set_one = "set browser.user_agent in #{Lowes::Config.config_path}"
 
-    def cdp_reachable?(timeout: 1.0)
-      uri = URI("#{CDP_URL}/json/version")
-      Net::HTTP.start(uri.host, uri.port, open_timeout: timeout, read_timeout: timeout) do |http|
-        http.get(uri.request_uri).is_a?(Net::HTTPSuccess)
+    # The browser's own description of itself, or nil if nothing usable is on
+    # the port. Chrome answers here with the version, the WebSocket URL, and —
+    # the reason this returns the body rather than a boolean — the User-Agent
+    # it is actually going to send.
+    #
+    # A 200 that is not JSON counts as nothing usable: `webSocketDebuggerUrl`
+    # is read out of this same body before any command can attach, so a body
+    # we cannot parse is a port we cannot use, and calling it "reachable"
+    # only moves the failure later.
+    #
+    # `url:` exists for the same reason `running_headless?` takes `profile:` —
+    # so a test can point it at something it started itself rather than at
+    # whatever Chrome the machine happens to have on 9222.
+    def cdp_version(timeout: 1.0, url: CDP_URL)
+      uri = URI("#{url}/json/version")
+      body = Net::HTTP.start(uri.host, uri.port, open_timeout: timeout, read_timeout: timeout) do |http|
+        response = http.get(uri.request_uri)
+        response.is_a?(Net::HTTPSuccess) ? response.body : nil
       end
+      body && JSON.parse(body)
     rescue StandardError
-      false
+      nil
+    end
+
+    def cdp_reachable?(timeout: 1.0)
+      !cdp_version(timeout: timeout).nil?
+    end
+
+    def cdp_user_agent(timeout: 1.0)
+      cdp_version(timeout: timeout).to_h["User-Agent"]
+    end
+
+    # Proof, in the one direction it goes. A `HeadlessChrome` token is only
+    # ever produced by a headless build that was left to name itself; its
+    # absence proves nothing, because a headless Chrome started the way this
+    # tool starts one is overriding that string on purpose. So: true means
+    # headless, false means "no idea".
+    def headless_ua? = cdp_user_agent.to_s.include?("HeadlessChrome")
+
+    # Akamai reads the User-Agent at the edge and answers 403 before the page
+    # loads, before its sensor runs, and before anything here gets a say. The
+    # browser will tell us it is about to send that token if we ask, so ask —
+    # otherwise this surfaces a few seconds later as an expired-session error
+    # naming the wrong cause.
+    #
+    # Also the only check that covers a Chrome someone started by hand: one
+    # launched without `--user-agent` is indistinguishable from a correct one
+    # until lowes.com refuses it.
+    def warn_headless_ua
+      ua = cdp_user_agent
+      return unless ua.to_s.include?("HeadlessChrome")
+
+      warn "lowes: the Chrome on 9222 advertises #{ua[%r{HeadlessChrome/\S*}]} — lowes.com answers 403 to that. " \
+           "It was started without --user-agent; quit it and rerun, or use `lowes chrome-start --headless`."
     end
 
     # Headless by default: every command that needs the browser used to raise
@@ -110,7 +158,10 @@ module Lowes
     # Returns true if Chrome is up (already-running or just-started),
     # false if we couldn't bring it up.
     def ensure_started(quiet: false, headless: nil)
-      return true if cdp_reachable?
+      if cdp_reachable?
+        warn_headless_ua unless quiet
+        return true
+      end
 
       require_relative "commands/chrome_start"
       headless = headless_default? if headless.nil?
@@ -120,8 +171,13 @@ module Lowes
       # buries the message ChromeStart already printed.
       status = Lowes::Commands::ChromeStart.new(silent: quiet).run([headless ? "--headless" : "--headed"])
       return false unless status.to_i.zero?
+      return false unless wait_for_cdp
 
-      wait_for_cdp
+      # Checked again on the browser we just launched, because passing
+      # `--user-agent` and the browser having taken it are different claims,
+      # and only the second one is the one that matters.
+      warn_headless_ua unless quiet
+      true
     end
 
     # A window the user can type into. `lowes login` is the one command that
@@ -140,8 +196,9 @@ module Lowes
         # Something is serving CDP but it is not ours to restart. Say so: if
         # it happens to be headless, the sign-in prompt below never appears
         # and the wait that follows is the timeout this method exists to
-        # prevent.
-        warn("lowes: Chrome on 9222 isn't one we started (different --profile?) — leaving it alone; sign in there if it has a window") unless quiet
+        # prevent. The browser can settle that much itself — see
+        # `headless_ua?` for why only the positive answer is worth acting on.
+        warn(foreign_chrome_warning) unless quiet
         return true
       end
 
@@ -149,6 +206,13 @@ module Lowes
       return false unless quit_ours
 
       ensure_started(quiet: quiet, headless: false)
+    end
+
+    def foreign_chrome_warning
+      base = "lowes: Chrome on 9222 isn't one we started (different --profile?) — leaving it alone"
+      return "#{base}; it reports itself headless, so there is no window to sign in to — quit it and rerun" if headless_ua?
+
+      "#{base}; sign in there if it has a window"
     end
 
     # How the Chrome that is already running was launched. `ps` is the only

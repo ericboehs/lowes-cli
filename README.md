@@ -175,6 +175,16 @@ real homepage and a validated `_abck` in about three seconds. The string is
 built rather than hardcoded on purpose — a UA naming a Chrome older than the
 engine behind it is a worse tell than `HeadlessChrome` was.
 
+That leaves one gap the flag cannot close: a Chrome someone started by hand,
+headless and without the override, looks exactly like a correct one until
+lowes.com refuses it. So before any command uses the browser, `lowes` asks it
+what it is going to say — `GET /json/version` on the debugging port returns the
+User-Agent verbatim — and if the token is in there, says so up front instead of
+letting it surface seconds later as a session error naming the wrong cause.
+Only the positive answer means anything: a headless Chrome started the way this
+tool starts one is overriding that string on purpose, so its absence is not
+evidence of a window.
+
 `lowes login` is always headed, and restarts a headless Chrome with a window
 first if it finds one, because signing in to a browser you cannot see is a
 ten-minute wait ending in a timeout.
