@@ -121,7 +121,10 @@ lowes config edit
 
 `browser` also takes `binary` (path to Chrome) and `user_agent` (override the
 string built from the binary's version — needed on a platform other than
-macOS or Linux).
+macOS or Linux). Both are passed through to the Python worker as
+`LOWES_CHROME_BINARY` / `LOWES_USER_AGENT`, so its fallback launcher names the
+same browser the CLI does. Whatever you set, it must not contain
+`HeadlessChrome`; that is the one token Akamai refuses outright.
 
 The `op://` references use the [1Password CLI](https://developer.1password.com/docs/cli/);
 swap in your own password manager or just hardcode a value if you must.
@@ -157,6 +160,11 @@ LOWES_HEADLESS=0 lowes sync     # this invocation
 # or "browser": { "headless": false } in config.json, permanently
 ```
 
+These decide how Chrome is *launched*, so they only bite when there is no
+Chrome on port 9222 yet. A command that finds one already running attaches to
+it as-is; to swap a headless Chrome for a windowed one, quit it first (or run
+`lowes login`, which does that for you).
+
 Headless costs one extra flag and it is not optional: Chrome names itself
 `HeadlessChrome/<version>` in its own User-Agent, and Akamai answers **403
 Access Denied** on that token before a byte of the page arrives — no `_abck`
@@ -171,8 +179,10 @@ engine behind it is a worse tell than `HeadlessChrome` was.
 first if it finds one, because signing in to a browser you cannot see is a
 ten-minute wait ending in a timeout.
 
-If no Chrome is reachable at all, lowes falls back to a plain Playwright
-Chromium — fine for opening pages but Lowe's may refuse the login.
+If no Chrome is reachable and none can be started, commands stop with the
+error rather than falling back — the Python worker can launch its own
+persistent Chromium context (`pyworker/stealth.py`), but nothing in the CLI
+reaches that path, and Lowe's tends to refuse a login through it anyway.
 
 ```bash
 lowes login                    # one-time browser-based login (handles captcha + 2FA)
