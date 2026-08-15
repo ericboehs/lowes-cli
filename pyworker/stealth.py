@@ -41,7 +41,6 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 
 CHROME_BINARIES = (
