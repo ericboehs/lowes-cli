@@ -163,7 +163,23 @@ def open_stealth_context(
     # The real binary, not Playwright's bundled "Chrome for Testing" — a
     # different build than the one measured to pass, and testing the wrong
     # binary answers the wrong question.
+    from playwright.sync_api import Error as PlaywrightError
+
     try:
         return p.chromium.launch_persistent_context(channel="chrome", **options)
-    except Exception:  # noqa: BLE001 — no Chrome installed; bundled Chromium is the fallback
+    except PlaywrightError as e:
+        # Only "there is no Chrome here" belongs in the fallback — Playwright
+        # phrases both of those as "Chromium distribution 'chrome' is not
+        # found/supported". Anything else (a locked profile, a bad arg) would
+        # relaunch and fail the same way, with the first message thrown away.
+        if "chromium distribution" not in str(e).lower():
+            raise
+        # Bundled Chromium answering to a UA that names the *system* Chrome's
+        # version is exactly the mismatch this module exists to avoid, so say
+        # so rather than quietly shipping it.
+        print(
+            "lowes: Chrome not installed — falling back to Playwright's bundled "
+            "Chromium, whose engine won't match the User-Agent it sends",
+            file=sys.stderr,
+        )
         return p.chromium.launch_persistent_context(**options)
