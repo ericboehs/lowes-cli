@@ -654,6 +654,58 @@ def order_detail(page: Any, url: str, order_id: str | None,
     return detail or retry
 
 
+def _stored_in_range(stored_dates: list[str], start: date, end: date) -> int:
+    """How many orders the store already holds between two dates, inclusive.
+
+    Compared as ISO strings rather than parsed dates: that is the format the
+    index stores and the format these bounds serialize to, so parsing would
+    only add a way to fail. Anything malformed sorts outside every range and
+    is counted nowhere, which is the right answer for a date we cannot read.
+
+    Truncated to the day first, so an entry written with a time on it lands in
+    the range its date names. Without that, `2026-03-31T10:00:00Z` sorts past
+    a quarter ending `2026-03-31` and the last day of every quarter stops
+    counting.
+    """
+    lo, hi = start.isoformat(), end.isoformat()
+    return sum(1 for d in stored_dates if lo <= d[:10] <= hi)
+
+
+def range_shortfall(start: date, end: date, found: int, expected: int,
+                    reason: str | None = None) -> tuple[str, str] | None:
+    """What to say about a date range that produced `found` orders when the
+    store already holds `expected` in it. Returns `(level, msg)`, or None when
+    there is nothing worth saying.
+
+    Orders do not leave a date range once they are in it, so `expected` is a
+    floor the page has to clear. Coming back under it means the run is about to
+    skip orders it already knows exist — which is otherwise invisible, because
+    every step of the fetch succeeded.
+
+    `reason` is set when the order links never appeared at all, which is the
+    same shortfall reached by a different road: normal for a quarter with
+    nothing in it, and a failed page load for one the store has orders in.
+    Those two were previously one message at `info`, and `info` is hidden
+    unless `--verbose` — so a full sync over 2022-2026 returned 313 of 323
+    orders, dropped all of 2026 Q1, and printed a clean run.
+    """
+    if reason is not None and expected == 0:
+        return ("info", f"no order links for {start}..{end} (empty quarter): {reason}")
+    if found >= expected:
+        return None
+
+    plural = "s" if expected != 1 else ""
+    if reason is not None:
+        return ("warn",
+                (f"no order links for {start}..{end}, but the store has {expected} "
+                 f"order{plural} in that range — the page did not load or the "
+                 f"selector moved: {reason}"))
+    return ("warn",
+            (f"{start}..{end} returned {found} orders but the store has {expected} "
+             f"in that range; {expected - found} will keep whatever is already on "
+             "disk and not be refreshed"))
+
+
 def sync_orders(context: Any, req: dict[str, Any]) -> int:
     page = context.new_page()
     years = [int(y) for y in (req.get("years") or [_today().year])]
@@ -661,6 +713,7 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
     full_details = bool(req.get("full_details", True))
     detail_delay = float(req.get("detail_delay", 0.5))
     detail_jitter = float(req.get("detail_jitter", 0.25))
+    stored_dates = [d for d in (req.get("stored_order_dates") or []) if isinstance(d, str)]
 
     if not is_authenticated(context, page) and not _ensure_login(page, req):
         emit("error", msg="not authenticated; run `lowes login`")
@@ -694,16 +747,19 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
                      msg=f"goto failed for {start}..{end}: {e}")
                 continue
 
+            # What the store already holds for this range. A quarter cannot
+            # lose orders it has already been seen to contain, so this is the
+            # floor the page has to clear — and the only thing that separates
+            # "nothing here" from "nothing came back".
+            expected = _stored_in_range(stored_dates, start, end)
+
             try:
                 page.wait_for_selector('a[href*="account/orders/details"]', timeout=8000)
                 page.wait_for_timeout(800)
             except Exception as e:  # noqa: BLE001
-                # Usually an empty quarter, which is normal — Lowe's renders
-                # an empty list and the selector never appears. But a changed
-                # selector looks identical from here, and that silently syncs
-                # zero orders, so the reason goes on the record either way.
-                emit("log", level="info",
-                     msg=f"no order links for {start}..{end} (empty quarter, or the selector moved): {e}")
+                said = range_shortfall(start, end, 0, expected, reason=str(e))
+                if said:
+                    emit("log", level=said[0], msg=said[1])
                 continue
 
             _scroll_to_bottom(page)
@@ -725,6 +781,14 @@ def sync_orders(context: Any, req: dict[str, Any]) -> int:
                      msg=f"{start}..{end} returned {len(chunk_orders)} orders, at or past "
                          f"Lowe's {ORDERS_PER_VIEW_CAP}-per-view cap; that quarter needs "
                          "splitting or orders are being dropped")
+
+            # The list rendered and parsed, and still came back short of what
+            # the store holds. Nothing above catches this: the page loaded, the
+            # selector matched, the extractor succeeded. Only the store knows
+            # the answer is too small.
+            said = range_shortfall(start, end, len(chunk_orders), expected)
+            if said:
+                emit("log", level=said[0], msg=said[1])
 
             for o in chunk_orders:
                 oid = o.get("order_id")

@@ -50,7 +50,13 @@ module Lowes
       results
     end
 
-    def sync(email:, password:, years:, full_details: true, otp_secret: nil, rate_limit: {}, known_order_ids: [])
+    # `stored_order_dates` is what the store already has, and it is deliberately
+    # not the same list as `known_order_ids`: `--full` empties the skip list so
+    # every order is re-fetched, but it does not make the store forget what is
+    # in it. The worker uses the dates to notice a date range that came back
+    # emptier than the store says it should be.
+    def sync(email:, password:, years:, full_details: true, otp_secret: nil, rate_limit: {},
+             known_order_ids: [], stored_order_dates: [])
       request = {
         action: "sync_orders",
         email: email,
@@ -61,7 +67,8 @@ module Lowes
         detail_delay: rate_limit["detail_delay"],
         detail_jitter: rate_limit["detail_jitter"],
         retry_backoff: rate_limit["retry_backoff"],
-        known_order_ids: known_order_ids
+        known_order_ids: known_order_ids,
+        stored_order_dates: stored_order_dates
       }.compact
       _run_action(request)[:orders]
     end

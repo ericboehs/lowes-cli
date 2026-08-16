@@ -307,6 +307,15 @@ stops parsing, that's where to look first.
 (`?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD`), because the `?show=YYYY` view
 silently caps at 50 orders per year — quarters dodge the cap.
 
+Each chunk is checked against the store: orders don't leave a date range once
+they're in it, so a quarter that returns fewer than the store already holds
+means the page didn't load, the selector moved, or the list rendered short.
+`sync` warns and names the range. Without that check the failure is invisible
+— every step succeeds, and the run reports a clean finish over a quarter it
+never read. (Measured: a full sync returned 313 of 323 orders and dropped all
+of 2026 Q1 without printing anything.) Orders in a short quarter keep their
+existing files; nothing is deleted.
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).

@@ -51,7 +51,8 @@ module Lowes
           full_details: full_details,
           otp_secret: otp_secret,
           rate_limit: config.rate_limit,
-          known_order_ids: known_ids
+          known_order_ids: known_ids,
+          stored_order_dates: store.index["orders"].values.filter_map { |m| m["date"] }
         )
 
         orders.each { |o| store.write_order(o, detailed: full_details) }
