@@ -5,8 +5,20 @@ require "time"
 module Lowes
   module Commands
     class Sync
-      def initialize(global)
+      # How often the index is written out mid-run. The order files are the
+      # slow part and are already on disk; this only bounds how many of them
+      # a hard kill can leave unreadable, and the next sync re-fetches those
+      # anyway. Small enough that the loss is a rounding error, large enough
+      # not to rewrite the whole index once per order.
+      INDEX_FLUSH_EVERY = 25
+
+      # `worker:` is injectable for the same reason `Commands::Quotes` takes an
+      # `online_client:` — what happens to the store between the first order and
+      # the last is the behavior worth testing, and reaching it for real means
+      # Chrome, a login, and half an hour of scraping.
+      def initialize(global, worker: nil)
         @global = global
+        @worker = worker
       end
 
       def run(argv)
@@ -43,23 +55,42 @@ module Lowes
         known_ids = full_resync ? [] : store.index["orders"].keys
 
         log "syncing years: #{years.join(", ")}#{full_resync ? " (full re-sync)" : " (skipping #{known_ids.size} known)"}"
-        worker = Lowes::Worker.new(verbose: @global[:verbose], quiet: @global[:quiet])
-        orders = worker.sync(
-          email: config.email,
-          password: password,
-          years: years,
-          full_details: full_details,
-          otp_secret: otp_secret,
-          rate_limit: config.rate_limit,
-          known_order_ids: known_ids,
-          stored_order_dates: store.index["orders"].values.filter_map { |m| m["date"] }
-        )
+        worker = @worker || Lowes::Worker.new(verbose: @global[:verbose], quiet: @global[:quiet])
 
-        orders.each { |o| store.write_order(o, detailed: full_details) }
+        # Written as they arrive rather than collected and written at the end.
+        # A full sync is half an hour of scraping, and buffering it meant an
+        # interrupted run kept nothing at all — two stops in one session cost
+        # 43 and 67 orders of work that had already been fetched. Nothing here
+        # is unsafe to write early: `write_order` is idempotent per order and
+        # refuses to shrink one, so the partial store is a smaller version of
+        # the same result, not a different one.
+        written = 0
+        begin
+          worker.sync(
+            email: config.email,
+            password: password,
+            years: years,
+            full_details: full_details,
+            otp_secret: otp_secret,
+            rate_limit: config.rate_limit,
+            known_order_ids: known_ids,
+            stored_order_dates: store.index["orders"].values.filter_map { |m| m["date"] }
+          ) do |order|
+            store.write_order(order, detailed: full_details)
+            written += 1
+            store.flush_index! if (written % INDEX_FLUSH_EVERY).zero?
+          end
+        ensure
+          # An order whose file exists but whose index entry does not is an
+          # order nothing can read, so the index gets flushed on the way out
+          # however the run ends. `last_sync` is left alone unless the run
+          # actually finished — see below.
+          store.flush_index!
+        end
         store.commit_index!
 
-        append_sync_log(years, orders.size)
-        log "wrote #{orders.size} orders to #{Lowes::Config.orders_dir}"
+        append_sync_log(years, written)
+        log "wrote #{written} orders to #{Lowes::Config.orders_dir}"
         0
       end
 

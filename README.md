@@ -224,6 +224,12 @@ handles it from both ends:
 If an order really did change, delete
 `~/.local/share/lowes/orders/<year>/<id>.json` and sync again.
 
+Orders are written to the store as they're scraped, not collected and saved at
+the end, so a sync you interrupt keeps everything it had already fetched — and
+the next run skips those instead of paying for them again. Only `last_sync` is
+withheld from a run that didn't finish, because that field means "the store is
+up to date," which is exactly what a partial run can't claim.
+
 ```bash
 # Quotes
 lowes quotes sync
