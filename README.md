@@ -214,9 +214,9 @@ can't tell either from an order that genuinely had fewer items, so `sync`
 handles it from both ends:
 
 - **It looks twice.** A detail page that comes back with no line items gets
-  reloaded once; most recover on the second read, and only the ones that stay
-  empty are reported. That distinction is the whole point — a page that is
-  empty every time is Lowe's, not a bad sync.
+  reloaded once. Measured on a full re-sync, the reload recovered nothing — 0
+  of 29 — so treat a warning as a page that is genuinely empty rather than a
+  read worth retrying by hand. What the second look buys is that certainty.
 - **It won't shrink an order.** A placed order does not lose line items after
   the fact, so the longer list wins and the sync names the orders it
   protected. Items still get corrected in place; only removal is refused.
