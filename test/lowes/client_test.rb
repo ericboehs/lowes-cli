@@ -116,6 +116,81 @@ class LowesClientTest < Minitest::Test
     assert_equal "k=v", client.send(:build_cookie_header, [{ "name" => "k", "value" => "v", "domain" => "www.lowes.com" }])
   end
 
+  # ---- 403: Akamai vs the API ------------------------------------------
+  #
+  # Both arrive as 403. One means the edge decided this browser is a bot and
+  # never let the request through; the other means the API considered it and
+  # said no. Telling the user to sign in again is wrong advice for the first
+  # and useless for the second, so the body is what picks the message.
+
+  AKAMAI_BODY = <<~HTML.freeze
+    <HTML><HEAD><TITLE>Access Denied</TITLE></HEAD><BODY>
+    <H1>Access Denied</H1>
+    You don't have permission to access "/digitalpro/api/quote/" on this server.<P>
+    Reference #18.4d1c2f17.1755388800.1a2b3c4d
+    </BODY></HTML>
+  HTML
+
+  def test_akamai_403_says_bot_check_not_signed_out
+    err = assert_raises(Lowes::Client::Error) do
+      capture_request(status: "403", response_body: AKAMAI_BODY,
+                      response_headers: { "Content-Type" => "text/html" }) { @client.get_quote("12345") }
+    end
+    assert_equal 403, err.status
+    assert_match(/Akamai/, err.message)
+    # The 401 text sends you off to sign in again. That is the wrong errand
+    # here, and it is the whole point of splitting the two.
+    refute_match(/sign in to/i, err.message)
+  end
+
+  # Lowe's support asks for this number, and it exists only in the response
+  # that just got thrown away.
+  def test_akamai_403_carries_the_reference_number
+    err = assert_raises(Lowes::Client::Error) do
+      capture_request(status: "403", response_body: AKAMAI_BODY,
+                      response_headers: { "Content-Type" => "text/html" }) { @client.get_quote("12345") }
+    end
+    assert_match(/18\.4d1c2f17\.1755388800\.1a2b3c4d/, err.message)
+  end
+
+  def test_api_403_is_left_to_the_generic_message
+    err = assert_raises(Lowes::Client::Error) do
+      capture_request(status: "403", response_body: '{"message":"not your quote"}',
+                      response_headers: { "Content-Type" => "application/json" }) { @client.get_quote("12345") }
+    end
+    assert_equal 403, err.status
+    refute_match(/Akamai/, err.message)
+    assert_equal({ "message" => "not your quote" }, err.body)
+  end
+
+  # A 403 the API answered is worth one cookie refresh — a stale session is a
+  # plausible cause. A 403 Akamai answered is not, and spending the single
+  # retry on it is how a later fixable 401 ends up with none left.
+  def test_api_403_still_spends_the_one_refresh
+    captured = {}
+    err = assert_raises(Lowes::Client::Error) do
+      capture_request(status: "403", response_body: '{"message":"nope"}',
+                      response_headers: { "Content-Type" => "application/json" }, into: captured) do
+        refreshing_client.get_quote("12345")
+      end
+    end
+    assert_equal 403, err.status
+    assert_equal 1, @reloads
+    assert_equal 2, captured[:count]
+  end
+
+  def test_akamai_403_does_not_refresh_or_retry
+    captured = {}
+    assert_raises(Lowes::Client::Error) do
+      capture_request(status: "403", response_body: AKAMAI_BODY,
+                      response_headers: { "Content-Type" => "text/html" }, into: captured) do
+        refreshing_client.get_quote("12345")
+      end
+    end
+    assert_equal 0, @reloads
+    assert_equal 1, captured[:count]
+  end
+
   # ---- refresh_cookies! ------------------------------------------------
 
   def test_refresh_keeps_existing_cookies_when_cdp_comes_back_empty
@@ -167,6 +242,18 @@ class LowesClientTest < Minitest::Test
 
   private
 
+  # `auto_refresh` needs somewhere to refresh from; the reload itself is
+  # counted rather than performed, since what's under test is whether it
+  # happens at all.
+  def refreshing_client
+    @reloads = 0
+    counter = -> { @reloads += 1 }
+    client = Lowes::Client.new(cookies: @cookies, auto_refresh: true,
+                               storage_state_path: Lowes::Config.cache_dir.join("storage_state.json"))
+    client.define_singleton_method(:reload_cookies!) { counter.call }
+    client
+  end
+
   # Stands in for the whole CDP conversation: Chrome being up, the tab nudge,
   # and the cookie read.
   def with_cdp_cookies(cookies)
@@ -184,9 +271,12 @@ class LowesClientTest < Minitest::Test
   end
 
   # Stub Net::HTTP.start so no real HTTP happens. Captures the last request.
-  def capture_request(status: "200", response_body: "{}")
-    captured = {}
-    fake_resp = FakeResponse.new(status, response_body)
+  # `into:` lets a caller keep the capture when the block raises — the return
+  # value never arrives on that path, and the retry count is exactly what the
+  # error cases need to check.
+  def capture_request(status: "200", response_body: "{}", response_headers: {}, into: {})
+    captured = into
+    fake_resp = FakeResponse.new(status, response_body, response_headers)
     original = Net::HTTP.method(:start)
     Net::HTTP.singleton_class.send(:remove_method, :start)
     Net::HTTP.define_singleton_method(:start) do |_host, _port = nil, **_opts, &blk|
@@ -209,17 +299,20 @@ class LowesClientTest < Minitest::Test
 
     def request(req)
       @captured[:req] = req
+      @captured[:count] = @captured.fetch(:count, 0) + 1
       @resp
     end
   end
 
   class FakeResponse
-    def initialize(code, body)
+    def initialize(code, body, headers = {})
       @code = code
       @body = body
+      @headers = headers.transform_keys(&:downcase)
     end
     def code; @code; end
     def body; @body; end
+    def [](key); @headers[key.to_s.downcase]; end
     def is_a?(klass)
       return @code.start_with?("2") if klass == Net::HTTPSuccess
       super
