@@ -49,9 +49,30 @@ module Lowes
         ensure_lowes_tab!(cdp_url: cdp_url)
         cookies = cdp_get_cookies(cdp_url: cdp_url)
       end
+      fresh = lowes_cookies(cookies)
+      # An empty result is "we could not read them", not "there are none".
+      # Chrome mid-restart, a tab that hasn't loaded yet, a WebSocket that
+      # closed early — all land here, and writing that over a file holding a
+      # working signed-in session trades a retryable hiccup for a real
+      # sign-in. Returning 0 already tells the caller we came back empty.
+      if fresh.empty? && existing_lowes_cookie_count(path).positive?
+        warn "lowes: CDP returned no lowes.com cookies — keeping the ones already in #{File.basename(path)}"
+        return 0
+      end
+
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, JSON.pretty_generate({ "cookies" => cookies, "origins" => [] }))
-      lowes_cookies(cookies).size
+      fresh.size
+    end
+
+    # Only the count matters here, and a storage_state we cannot parse is one
+    # there is nothing to protect in — so an unreadable file reads as zero and
+    # the write goes ahead.
+    def self.existing_lowes_cookie_count(path)
+      return 0 unless File.exist?(path)
+      lowes_cookies(JSON.parse(File.read(path))["cookies"] || []).size
+    rescue StandardError
+      0
     end
 
     def self.lowes_cookies(cookies)

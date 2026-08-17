@@ -116,7 +116,72 @@ class LowesClientTest < Minitest::Test
     assert_equal "k=v", client.send(:build_cookie_header, [{ "name" => "k", "value" => "v", "domain" => "www.lowes.com" }])
   end
 
+  # ---- refresh_cookies! ------------------------------------------------
+
+  def test_refresh_keeps_existing_cookies_when_cdp_comes_back_empty
+    path = Lowes::Config.cache_dir.join("storage_state.json")
+    good = { "cookies" => [{ "name" => "session", "value" => "abc", "domain" => "www.lowes.com" }] }
+    File.write(path, JSON.generate(good))
+
+    count = nil
+    _, err = capture_io do
+      count = with_cdp_cookies([]) { Lowes::Client.refresh_cookies!(path: path) }
+    end
+
+    assert_equal 0, count
+    assert_equal good["cookies"], JSON.parse(File.read(path))["cookies"]
+    assert_match(/keeping the ones already in/, err)
+  end
+
+  # Nothing to protect, so the empty read is written through rather than
+  # leaving the caller with a file that never appears.
+  def test_refresh_writes_through_when_there_is_nothing_to_lose
+    path = Lowes::Config.cache_dir.join("storage_state.json")
+    count = with_cdp_cookies([]) { Lowes::Client.refresh_cookies!(path: path) }
+
+    assert_equal 0, count
+    assert_equal [], JSON.parse(File.read(path))["cookies"]
+  end
+
+  def test_refresh_replaces_cookies_when_cdp_has_them
+    path = Lowes::Config.cache_dir.join("storage_state.json")
+    File.write(path, JSON.generate({ "cookies" => [{ "name" => "old", "value" => "1", "domain" => "www.lowes.com" }] }))
+    fresh = [{ "name" => "new", "value" => "2", "domain" => ".lowes.com" }]
+
+    count = with_cdp_cookies(fresh) { Lowes::Client.refresh_cookies!(path: path) }
+
+    assert_equal 1, count
+    assert_equal fresh, JSON.parse(File.read(path))["cookies"]
+  end
+
+  # An unreadable file is not a session worth keeping, so it must not be the
+  # thing that blocks a good write.
+  def test_unparseable_storage_state_counts_as_empty
+    path = Lowes::Config.cache_dir.join("storage_state.json")
+    File.write(path, "{ not json")
+    assert_equal 0, Lowes::Client.existing_lowes_cookie_count(path)
+
+    with_cdp_cookies([]) { Lowes::Client.refresh_cookies!(path: path) }
+    assert_equal [], JSON.parse(File.read(path))["cookies"]
+  end
+
   private
+
+  # Stands in for the whole CDP conversation: Chrome being up, the tab nudge,
+  # and the cookie read.
+  def with_cdp_cookies(cookies)
+    stubbed = { ensure_chrome_alive!: ->(**) { true },
+                ensure_lowes_tab!: ->(**) { true },
+                cdp_get_cookies: ->(**) { cookies } }
+    originals = stubbed.keys.to_h { |name| [name, Lowes::Client.method(name)] }
+    stubbed.each { |name, impl| Lowes::Client.define_singleton_method(name, &impl) }
+    yield
+  ensure
+    # `module_function`-style singleton methods are replaced, not shadowed —
+    # putting the originals back is the only way the rest of the suite keeps
+    # the real ones.
+    originals.each { |name, impl| Lowes::Client.define_singleton_method(name, impl) }
+  end
 
   # Stub Net::HTTP.start so no real HTTP happens. Captures the last request.
   def capture_request(status: "200", response_body: "{}")
