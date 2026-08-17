@@ -1,6 +1,7 @@
 require "json"
 require "open3"
 require "io/console"
+require_relative "stderr_tail"
 
 module Lowes
   class Worker
@@ -187,10 +188,7 @@ module Lowes
       Open3.popen3(worker_env, *cmd, chdir: PYWORKER) do |stdin, stdout, stderr, wait|
         stdin.write(JSON.generate(request) + "\n")
 
-        err_thread = Thread.new do
-          stderr.each_line { |l| warn(l.chomp) if @verbose }
-        rescue IOError
-        end
+        err_thread, err_lines = StderrTail.drain(stderr, echo: @verbose)
 
         stdout.each_line do |line|
           line = line.strip
@@ -218,6 +216,9 @@ module Lowes
         err_thread.join
         status = wait.value
         unless status.success?
+          # "python worker exited 1" on its own says nothing. The reason was on
+          # stderr a moment ago; print it before the exception replaces it.
+          StderrTail.report(err_lines, "lowes: worker exited #{status.exitstatus}") unless @verbose
           raise Error, "python worker exited #{status.exitstatus}"
         end
       end
