@@ -1,5 +1,6 @@
 require "open3"
 require "json"
+require_relative "../stderr_tail"
 
 module Lowes
   module Commands
@@ -40,10 +41,7 @@ module Lowes
 
         Open3.popen3(python, "login.py", chdir: PYWORKER) do |stdin, stdout, stderr, wait|
           stdin.close
-          err_thread = Thread.new do
-            stderr.each_line { |l| warn(l.chomp) if @global[:verbose] }
-          rescue IOError
-          end
+          err_thread, err_lines = Lowes::StderrTail.drain(stderr, echo: @global[:verbose])
           stdout.each_line do |line|
             line = line.strip
             next if line.empty?
@@ -61,7 +59,13 @@ module Lowes
             end
           end
           err_thread.join
-          return wait.value.exitstatus
+          status = wait.value.exitstatus
+          # Already echoed live under --verbose; this is for the quiet run that
+          # would otherwise end at a bare non-zero exit code.
+          if !status.zero? && !@global[:verbose]
+            Lowes::StderrTail.report(err_lines, "lowes login: browser worker exited #{status}")
+          end
+          return status
         end
       end
     end

@@ -20,6 +20,13 @@ module Lowes
     # hence `Lowes::Chrome.user_agent`, which asks the binary.
     FALLBACK_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36".freeze
     CDP_URL = "http://127.0.0.1:9222".freeze
+    # A 403 from lowes.com is two different failures wearing one status code.
+    # The quote API returns JSON when it means "not your quote"; Akamai returns
+    # its HTML denial page at the edge, before the API is reached at all. The
+    # advice for those is opposite — one is a permissions problem, the other
+    # says the browser failed a bot check and no amount of re-auth will fix
+    # it — so the body is what decides, not the code.
+    AKAMAI_MARKERS = /access denied|you don't have permission to access|reference\s*#/i
 
     def self.default_user_agent
       require_relative "chrome"
@@ -49,9 +56,30 @@ module Lowes
         ensure_lowes_tab!(cdp_url: cdp_url)
         cookies = cdp_get_cookies(cdp_url: cdp_url)
       end
+      fresh = lowes_cookies(cookies)
+      # An empty result is "we could not read them", not "there are none".
+      # Chrome mid-restart, a tab that hasn't loaded yet, a WebSocket that
+      # closed early — all land here, and writing that over a file holding a
+      # working signed-in session trades a retryable hiccup for a real
+      # sign-in. Returning 0 already tells the caller we came back empty.
+      if fresh.empty? && existing_lowes_cookie_count(path).positive?
+        warn "lowes: CDP returned no lowes.com cookies — keeping the ones already in #{File.basename(path)}"
+        return 0
+      end
+
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, JSON.pretty_generate({ "cookies" => cookies, "origins" => [] }))
-      lowes_cookies(cookies).size
+      fresh.size
+    end
+
+    # Only the count matters here, and a storage_state we cannot parse is one
+    # there is nothing to protect in — so an unreadable file reads as zero and
+    # the write goes ahead.
+    def self.existing_lowes_cookie_count(path)
+      return 0 unless File.exist?(path)
+      lowes_cookies(JSON.parse(File.read(path))["cookies"] || []).size
+    rescue StandardError
+      0
     end
 
     def self.lowes_cookies(cookies)
@@ -270,7 +298,13 @@ module Lowes
       body = resp.body.to_s
       parsed = body.empty? ? nil : (try_json(body) || body)
       unless resp.is_a?(Net::HTTPSuccess)
-        if [401, 403].include?(resp.code.to_i) && @auto_refresh && !@refreshed_once
+        akamai = akamai_denial?(resp, body)
+        # A stale `_abck` is a real cause of a 403, so the refresh-and-retry
+        # stays — except when the body already said Akamai turned us away.
+        # Re-reading cookies out of the same browser cannot change that
+        # verdict, and spending the one retry here is how a later, fixable
+        # 401 ends up with none left.
+        if [401, 403].include?(resp.code.to_i) && !akamai && @auto_refresh && !@refreshed_once
           @refreshed_once = true
           reload_cookies!
           return request(rebuild_request(req), headers: headers)
@@ -282,9 +316,34 @@ module Lowes
             status: 401, body: parsed
           )
         end
+        if akamai
+          raise Error.new(
+            "HTTP 403 #{req.method} #{uri.path} — blocked by Akamai, not signed out. " \
+            "Fresh cookies won't help; the bot check itself failed. Open the Chrome " \
+            "window on port 9222, load lowes.com and let it settle, then retry." \
+            "#{akamai_reference(body)}",
+            status: 403, body: parsed
+          )
+        end
         raise Error.new("HTTP #{resp.code} #{req.method} #{uri.path}", status: resp.code.to_i, body: parsed)
       end
       parsed
+    end
+
+    # Deliberately narrow: a JSON body is the API answering, and the API is
+    # never Akamai. Only the edge's HTML page gets the bot-check message.
+    def akamai_denial?(resp, body)
+      return false unless resp.code.to_i == 403
+      return false if resp["content-type"].to_s.include?("json")
+      AKAMAI_MARKERS.match?(body)
+    end
+
+    # Akamai stamps each denial with a reference number, and it is the one
+    # thing Lowe's support can look up. Cheap to carry, useless to regenerate
+    # later.
+    def akamai_reference(body)
+      ref = body[/reference\s*#\s*([0-9a-z.\-]+)/i, 1]
+      ref ? "\nAkamai reference ##{ref}" : ""
     end
 
     def reload_cookies!
