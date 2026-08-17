@@ -12,8 +12,9 @@ class SyncRequestTest < Minitest::Test
   class CapturingWorker < Lowes::Worker
     attr_reader :request
 
-    def _run_action(request)
+    def _run_action(request, on_order: nil)
       @request = request
+      @on_order = on_order
       { orders: [], quotes: [], prices: [] }
     end
   end

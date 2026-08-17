@@ -214,15 +214,21 @@ can't tell either from an order that genuinely had fewer items, so `sync`
 handles it from both ends:
 
 - **It looks twice.** A detail page that comes back with no line items gets
-  reloaded once; most recover on the second read, and only the ones that stay
-  empty are reported. That distinction is the whole point — a page that is
-  empty every time is Lowe's, not a bad sync.
+  reloaded once. Measured on a full re-sync, the reload recovered nothing — 0
+  of 29 — so treat a warning as a page that is genuinely empty rather than a
+  read worth retrying by hand. What the second look buys is that certainty.
 - **It won't shrink an order.** A placed order does not lose line items after
   the fact, so the longer list wins and the sync names the orders it
   protected. Items still get corrected in place; only removal is refused.
 
 If an order really did change, delete
 `~/.local/share/lowes/orders/<year>/<id>.json` and sync again.
+
+Orders are written to the store as they're scraped, not collected and saved at
+the end, so a sync you interrupt keeps everything it had already fetched — and
+the next run skips those instead of paying for them again. Only `last_sync` is
+withheld from a run that didn't finish, because that field means "the store is
+up to date," which is exactly what a partial run can't claim.
 
 ```bash
 # Quotes

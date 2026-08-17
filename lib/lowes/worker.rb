@@ -24,13 +24,20 @@ module Lowes
       _run_action(request)
     end
 
-    def _run_action(request)
+    # `on_order` is handed each order the moment the worker emits it. The
+    # accumulated list is still returned — callers that only want the whole
+    # run at the end are unaffected — but a caller that wants to durably store
+    # each order as it arrives no longer has to wait for the run to finish to
+    # get the chance.
+    def _run_action(request, on_order: nil)
       results = { orders: [], quotes: [], prices: [] }
       error_msg = nil
       progress = Progress.new(quiet: @quiet)
       run(request) do |event|
         case event["event"]
-        when "order"    then results[:orders] << event["data"]
+        when "order"
+          results[:orders] << event["data"]
+          on_order&.call(event["data"])
         when "quote"    then results[:quotes] << event["data"]
         when "price"    then results[:prices] << event["data"]
         when "total"    then progress.start(event)
@@ -57,7 +64,7 @@ module Lowes
     # in it. The worker uses the dates to notice a date range that came back
     # emptier than the store says it should be.
     def sync(email:, password:, years:, full_details: true, otp_secret: nil, rate_limit: {},
-             known_order_ids: [], stored_order_dates: [])
+             known_order_ids: [], stored_order_dates: [], &on_order)
       request = {
         action: "sync_orders",
         email: email,
@@ -71,7 +78,7 @@ module Lowes
         known_order_ids: known_order_ids,
         stored_order_dates: stored_order_dates
       }.compact
-      _run_action(request)[:orders]
+      _run_action(request, on_order: on_order)[:orders]
     end
 
     def fetch_prices(items:, store_zip: nil)

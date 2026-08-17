@@ -136,9 +136,21 @@ module Lowes
 
     # ----- Index commit -----
 
+    # Make the index on disk match the one in memory, without claiming a sync
+    # finished. `write_order` puts the file down but leaves the index entry in
+    # memory, and an order the index does not list is an order nothing can
+    # read — so a long sync flushes as it goes, and an interrupted one leaves
+    # behind orders that are actually reachable.
+    def flush_index!
+      File.write(@index_path, JSON.pretty_generate(index) + "\n")
+    end
+
+    # For a run that finished. `last_sync` is the record of when the store was
+    # last brought fully up to date, which is exactly what a partial run has
+    # not done — hence the split.
     def commit_index!(synced_at: Time.now.utc.iso8601)
       index["last_sync"] = synced_at
-      File.write(@index_path, JSON.pretty_generate(index) + "\n")
+      flush_index!
     end
 
     private
